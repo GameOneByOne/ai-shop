@@ -1,0 +1,1 @@
+import{ExperimentLab}from"@/components/experiments/experiment-lab";import{listSkus}from"@/lib/data/store";export default async function Page(){const skus=await listSkus();return <><header className="top"><div><h1>单变量实验</h1><p className="muted">记录每次运营修改并用真实指标评估</p></div></header><ExperimentLab skus={skus}/></>}

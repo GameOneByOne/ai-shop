@@ -1,0 +1,1 @@
+import{SourcingDiscovery}from"@/components/sourcing/sourcing-discovery";export default function Page(){return <><header className="top"><div><div className="eyebrow">Sourcing Agent</div><h1>货源发现与粗筛</h1><p className="muted">低频采集、规则粗筛、AI 细筛、人工决定上新</p></div></header><div className="notice">不会自动下单或联系供应商；上新前必须人工复核。</div><SourcingDiscovery/></>}

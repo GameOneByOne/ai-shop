@@ -1,0 +1,1 @@
+import{ContentStudio}from"@/components/content/content-studio";import{listSkus}from"@/lib/data/store";export default async function Page(){const skus=await listSkus();return <><header className="top"><div><h1>AI 内容工作室</h1><p className="muted">基于真实 SKU 商品资料生成内容草稿</p></div></header><ContentStudio skus={skus}/></>}

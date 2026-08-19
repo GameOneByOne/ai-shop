@@ -1,0 +1,1 @@
+import{CustomerServiceAssistant}from"@/components/customer-service/customer-service-assistant";import{listSkus}from"@/lib/data/store";export default async function Page(){const skus=await listSkus();return <><header className="top"><div><h1>AI 客服助手</h1><p className="muted">基于已验证商品事实生成待审核回复</p></div></header><CustomerServiceAssistant skus={skus}/></>}
