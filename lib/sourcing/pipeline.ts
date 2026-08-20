@@ -30,6 +30,32 @@ export interface EvaluatedProduct extends SourceProduct {
   estimatedUnitProfitMax?: number;
 }
 
+export interface SourcingBusinessRules {
+  minPurchasePrice: number;
+  maxPreferredPurchasePrice: number;
+  maxPreferredMoq: number;
+  targetMarginRate: number;
+  minUnitProfit: number;
+  preferredRepurchaseRate: number;
+  shippingAssumption: number;
+  packagingAssumption: number;
+  afterSalesReserve: number;
+  platformAndPromotionRate: number;
+}
+
+const defaultRules: SourcingBusinessRules = {
+  minPurchasePrice: 2,
+  maxPreferredPurchasePrice: 30,
+  maxPreferredMoq: 5,
+  targetMarginRate: .45,
+  minUnitProfit: 5,
+  preferredRepurchaseRate: 20,
+  shippingAssumption: 3,
+  packagingAssumption: .5,
+  afterSalesReserve: .5,
+  platformAndPromotionRate: .16,
+};
+
 const money = (value: number) => Math.round(value * 100) / 100;
 const salesMultiplier = (unit?: string) => (unit === "万" ? 10_000 : 1);
 function parseSales(text: string) {
@@ -44,19 +70,21 @@ function clusterFor(title: string) {
   if (/静电|双面.*刷|除毛刷|粘毛刷/.test(title)) return "双面静电刷";
   return title.replace(/[\s\d¥￥.+%-]/g, "").slice(0, 12) || "其他";
 }
-function proposedPrice(cost: number) {
-  const fixedCosts = 4; // 运费3 + 包装0.5 + 售后预留0.5
-  const byProfit = (cost + fixedCosts + 5) / 0.84; // 平台+推广按售价16%预留
-  const byMargin = (cost + fixedCosts) / 0.44; // 同时满足约40%利润率
+function proposedPrice(cost: number, rules: SourcingBusinessRules) {
+  const fixedCosts = rules.shippingAssumption + rules.packagingAssumption + rules.afterSalesReserve;
+  const netRate = 1 - rules.platformAndPromotionRate;
+  const byProfit = (cost + fixedCosts + rules.minUnitProfit) / netRate;
+  const byMargin = (cost + fixedCosts) / Math.max(.05, netRate - rules.targetMarginRate);
   const minimum = Math.max(byProfit, byMargin);
   const rounded = Math.ceil(minimum) - 0.1;
   return { min: money(rounded), max: money(rounded + 3) };
 }
-function unitProfit(price: number, cost: number) {
-  return money(price * 0.84 - cost - 4);
+function unitProfit(price: number, cost: number, rules: SourcingBusinessRules) {
+  return money(price * (1 - rules.platformAndPromotionRate) - cost - rules.shippingAssumption - rules.packagingAssumption - rules.afterSalesReserve);
 }
 
-export function evaluateProducts(items: SourceProduct[]): EvaluatedProduct[] {
+export function evaluateProducts(items: SourceProduct[], configuredRules: Partial<SourcingBusinessRules> = {}): EvaluatedProduct[] {
+  const rules = { ...defaultRules, ...configuredRules };
   const evaluated = items.map((item) => {
     const text = item.title;
     const rawText = String(item.rawData?.cardText || text);
@@ -76,13 +104,13 @@ export function evaluateProducts(items: SourceProduct[]): EvaluatedProduct[] {
     const rejected: string[] = [];
 
     if (effectivePrice == null || effectivePrice <= 0) issues.push("采购价无效或未解析");
-    else if (effectivePrice < 2) issues.push("采购价低于2元，可能是配件价、最低SKU价或抓取错位");
+    else if (effectivePrice < rules.minPurchasePrice) issues.push(`采购价低于偏好下限 ¥${rules.minPurchasePrice}，可能是配件价、最低SKU价或抓取错位`);
     if (!effectiveMoq) issues.push("MOQ未解析");
     if (!/规格|款|cm|厘米|大号|小号|双面|单面|颜色/i.test(text)) issues.push("SKU/规格不明确");
     if (!/猫|宠物|粘毛|除毛|梳毛|刮毛/.test(text)) rejected.push("与猫咪居家用品定位不匹配");
-    if (effectivePrice != null && effectivePrice > 30) rejected.push("采购价超过30元");
-    if (effectiveMoq != null && effectiveMoq > 10) rejected.push("MOQ超过10件");
-    if (repurchaseRate != null && repurchaseRate < 20) rejected.push("回头率低于20%");
+    if (effectivePrice != null && effectivePrice > rules.maxPreferredPurchasePrice) issues.push(`采购价高于店铺偏好 ¥${rules.maxPreferredPurchasePrice}，需结合利润验证`);
+    if (effectiveMoq != null && effectiveMoq > rules.maxPreferredMoq) issues.push(`MOQ 高于店铺偏好 ${rules.maxPreferredMoq} 件`);
+    if (repurchaseRate != null && repurchaseRate < rules.preferredRepurchaseRate) issues.push(`回头率低于偏好 ${rules.preferredRepurchaseRate}%`);
     if (/药|保健|充电|电池|插电|加热|玻璃|陶瓷/.test(text)) rejected.push("首版高风险品类");
 
     const dataStatus: DataStatus = rejected.length
@@ -93,8 +121,8 @@ export function evaluateProducts(items: SourceProduct[]): EvaluatedProduct[] {
           ? "needs_review"
           : "valid";
     const price = effectivePrice;
-    const estimate = price != null && price > 0 ? proposedPrice(price) : undefined;
-    const profit = estimate && price != null ? Math.min(25, Math.round(((unitProfit(estimate.min, price) - 5) / 8) * 10 + 15)) : 0;
+    const estimate = price != null && price > 0 ? proposedPrice(price, rules) : undefined;
+    const profit = estimate && price != null ? Math.min(25, Math.round(((unitProfit(estimate.min, price, rules) - rules.minUnitProfit) / 8) * 10 + 15)) : 0;
     const demand = salesCount ? Math.min(15, Math.round(Math.log10(salesCount + 1) * 4)) : 2;
     const supplier = Math.min(20, (item.supplierName ? 5 : 0) + (repurchaseRate ? Math.min(10, Math.round(repurchaseRate / 10)) : 0) + (payLater ? 5 : 0));
     const afterSales = Math.min(10, (returnShipping ? 6 : 0) + (dropshipping ? 4 : 0));
@@ -102,7 +130,10 @@ export function evaluateProducts(items: SourceProduct[]): EvaluatedProduct[] {
     const competition = salesCount && salesCount > 20_000 ? 4 : salesCount && salesCount > 1000 ? 7 : 5;
     const differentiation = /双面|水洗|便携|替换|多功能/.test(text) ? 4 : 2;
     const breakdown = { profit: Math.max(0, profit), demand, supplier, afterSales, storeFit, competition, differentiation };
-    const rawScore = Object.values(breakdown).reduce((sum, value) => sum + value, 0);
+    const softPenalty = (price != null && price > rules.maxPreferredPurchasePrice ? 6 : 0)
+      + (effectiveMoq != null && effectiveMoq > rules.maxPreferredMoq ? 5 : 0)
+      + (repurchaseRate != null && repurchaseRate < rules.preferredRepurchaseRate ? 4 : 0);
+    const rawScore = Math.max(0, Object.values(breakdown).reduce((sum, value) => sum + value, 0) - softPenalty);
     const score = dataStatus === "valid" ? rawScore : dataStatus === "needs_review" ? Math.min(rawScore, 59) : 0;
     return {
       ...normalizedItem,
@@ -121,8 +152,8 @@ export function evaluateProducts(items: SourceProduct[]): EvaluatedProduct[] {
       rejectedReasons: rejected,
       estimatedSalePriceMin: estimate?.min,
       estimatedSalePriceMax: estimate?.max,
-      estimatedUnitProfitMin: estimate && price != null ? unitProfit(estimate.min, price) : undefined,
-      estimatedUnitProfitMax: estimate && price != null ? unitProfit(estimate.max, price) : undefined,
+      estimatedUnitProfitMin: estimate && price != null ? unitProfit(estimate.min, price, rules) : undefined,
+      estimatedUnitProfitMax: estimate && price != null ? unitProfit(estimate.max, price, rules) : undefined,
     } satisfies EvaluatedProduct;
   });
 

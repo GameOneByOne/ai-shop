@@ -1,0 +1,1 @@
+import{Purchases}from"@/components/fulfillment/orders";export default function Page(){return <><header className="top"><div><div className="eyebrow">MOCK 1688 PURCHASE</div><h1>1688 采购单</h1><p className="muted">仅展示经 AI Action 和人工批准后创建的 Mock 采购单</p></div></header><Purchases/></>}

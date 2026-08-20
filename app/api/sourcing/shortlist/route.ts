@@ -1,172 +1,35 @@
+import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
+import { buildProductDirections, type DirectionRecommendation, type ProductDirection } from "@/lib/sourcing/directions";
+import { sourceProductsFromRows } from "@/lib/sourcing/row-directions";
+import { isTrustedPrice } from "@/lib/sourcing/source-products";
 
-const requestSchema = z.object({
-  runId: z.string().uuid(),
-  limit: z.number().int().min(1).max(20).default(20),
-});
+const requestSchema=z.object({runId:z.string().uuid(),limit:z.number().int().min(1).max(20).default(20)});
+const aiDirection=z.object({directionId:z.string(),recommendation:z.enum(["PRIORITY_VERIFY","VERIFY","WATCH","REJECT"]),directionScore:z.number().min(0).max(100),confidence:z.enum(["LOW","MEDIUM","HIGH"]),summary:z.string().min(2),evidence:z.array(z.string()).min(1),hypotheses:z.array(z.string()).default([]),uncertainties:z.array(z.string()).default([]),blockers:z.array(z.string()).default([]),nextAction:z.string().min(2)});
+const outputSchema=z.object({summary:z.string().min(2),directions:z.array(aiDirection).max(20)});
+const priority={PRIORITY_VERIFY:4,VERIFY:3,WATCH:2,REJECT:1} as const,PROMPT_VERSION="sourcing-v2.7-direction-review-1";
 
-const aiOutputSchema = z.object({
-  summary: z.string().default(""),
-  items: z
-    .array(
-      z.object({
-        id: z.string().uuid(),
-        qualitativeScore: z.number().min(0).max(30),
-        reason: z.string(),
-        risks: z.array(z.string()).default([]),
-        checks: z.array(z.string()).default([]),
-      }),
-    )
-    .max(20),
-});
-
-const cleanList = (values: string[]) =>
-  values.map((value) => value.trim()).filter((value) => value.length >= 2);
-
-export async function POST(request: Request) {
-  const parsedRequest = requestSchema.safeParse(
-    await request.json().catch(() => null),
-  );
-  if (!parsedRequest.success) {
-    return Response.json({ error: "细筛参数无效" }, { status: 400 });
-  }
-
-  const db = await createClient();
-  const { data: auth } = await db.auth.getUser();
-  if (!auth.user) {
-    return Response.json({ error: "请先登录" }, { status: 401 });
-  }
-
-  const { data: products } = await db
-    .from("source_products")
-    .select(
-      "id,title,price_min,minimum_order_quantity,supplier_name,sales_hint,sales_count,repurchase_rate,return_shipping,pay_later,dropshipping,cluster_key,rough_score,score_breakdown,estimated_sale_price_min,estimated_sale_price_max,estimated_unit_profit_min,estimated_unit_profit_max",
-    )
-    .eq("sourcing_run_id", parsedRequest.data.runId)
-    .in("data_status", ["valid", "needs_review"])
-    .eq("cluster_rank", 1)
-    .order("rough_score", { ascending: false })
-    .limit(20);
-  if (!products?.length) {
-    return Response.json({ error: "没有粗筛结果" }, { status: 422 });
-  }
-
-  const prompt = `你是猫咪居家用品店的谨慎选品经理。候选已经完成数据校验、利润计算、硬过滤和同质聚类。请从不同商品类型中最多选 ${parsedRequest.data.limit} 款进入人工复核。
-
-只判断程序难以可靠判断的定性项目，qualitativeScore 为 0～30：
-- 猫咪家庭真实需求匹配 0～10
-- 视频/图文展示与卖点潜力 0～8
-- 相对同类的差异化 0～6
-- 材质、误食、耐用性与使用体验风险 0～6
-不要重新计算价格、利润、销量、回头率、MOQ 或供应商分。
-
-硬性要求：
-1. 不得编造候选数据中没有的信息；标题中的销量、回头率等只能称为“搜索页展示值”。
-2. 每款 reason 必须引用至少两个实际字段并说明取舍。
-3. 每款 risks 至少 2 项，checks 至少 3 项；食品、药品、电器、易碎、吞咽风险从严。
-4. 只输出 JSON：{"summary":"","items":[{"id":"UUID","qualitativeScore":0,"reason":"","risks":[""],"checks":[""]}]}。
-
-候选数据：${JSON.stringify(products)}`;
-
-  const baseUrl = (process.env.OPENAI_BASE_URL || "https://api.deepseek.com").replace(
-    /\/$/,
-    "",
-  );
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: process.env.OPENAI_MODEL,
-      messages: [
-        { role: "system", content: "只输出合法 JSON，严格遵守评分规则。" },
-        { role: "user", content: prompt },
-      ],
-      response_format: { type: "json_object" },
-      max_tokens: 4000,
-      thinking: { type: "disabled" },
-    }),
-    signal: AbortSignal.timeout(120_000),
-  });
-  const body = await response.json();
-  if (!response.ok) {
-    return Response.json(
-      { error: body.error?.message ?? "AI 请求失败" },
-      { status: 502 },
-    );
-  }
-
-  let value: unknown;
-  try {
-    value = JSON.parse(body.choices?.[0]?.message?.content ?? "");
-  } catch {
-    return Response.json({ error: "AI 未返回合法 JSON" }, { status: 502 });
-  }
-  const parsedOutput = aiOutputSchema.safeParse(value);
-  if (!parsedOutput.success) {
-    return Response.json({ error: "AI 结果校验失败" }, { status: 502 });
-  }
-
-  const allowed = new Set(products.map((product) => product.id));
-  const chosen = parsedOutput.data.items
-    .filter((item) => allowed.has(item.id))
-    .map((item) => {
-      const product = products.find((candidate) => candidate.id === item.id)!;
-      const ruleScore = Number(product.rough_score || 0);
-      return {
-        ...item,
-        ruleScore,
-        score: Math.min(
-          100,
-          Math.round(ruleScore * 0.7 + item.qualitativeScore),
-        ),
-        scoreBreakdown: product.score_breakdown,
-      };
-    })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, parsedRequest.data.limit)
-    .map((item) => {
-      const risks = cleanList(item.risks);
-      const checks = cleanList(item.checks);
-      return {
-        ...item,
-        reason: item.reason.trim() || "需结合详情页完成进一步判断",
-        risks:
-          risks.length >= 2
-            ? risks
-            : ["搜索页信息可能与详情页不一致", "材质与售后数据尚未核验"],
-        checks:
-          checks.length >= 3
-            ? checks
-            : ["核对阶梯价与起订量", "索取材质及质检证明", "确认退换货与代发条件"],
-      };
-    });
-
-  await db
-    .from("source_products")
-    .update({ selected: false, ai_rank: null })
-    .eq("sourcing_run_id", parsedRequest.data.runId);
-  await Promise.all(
-    chosen.map((item, index) =>
-      db
-        .from("source_products")
-        .update({
-          ai_score: item.score,
-          ai_rank: index + 1,
-          ai_reason: item.reason,
-          ai_risks: item.risks,
-          selected: true,
-        })
-        .eq("id", item.id),
-    ),
-  );
-
-  return Response.json({
-    summary: parsedOutput.data.summary,
-    items: chosen,
-    model: body.model,
-  });
+export async function POST(request:Request){
+ const parsed=requestSchema.safeParse(await request.json().catch(()=>null));if(!parsed.success)return Response.json({error:"方向复核参数无效"},{status:400});
+ const db=await createClient(),{data:auth}=await db.auth.getUser();if(!auth.user)return Response.json({error:"请先登录"},{status:401});
+ const {data:run,error:runError}=await db.from("sourcing_runs").select("id,query,keywords,criteria").eq("id",parsed.data.runId).eq("user_id",auth.user.id).single();if(runError||!run)return Response.json({error:"Sourcing Run 不存在"},{status:404});
+ const {data:rows,error}=await db.from("source_products").select("*").eq("sourcing_run_id",run.id).in("data_status",["valid","needs_review"]);if(error)return Response.json({error:error.message},{status:500});
+ const oldCriteria=(run.criteria??{})as Record<string,unknown>,pipeline=(oldCriteria.pipeline??{})as Record<string,unknown>,stage2Version=Number(pipeline.stage2Version??0);if(pipeline.stage2Status!=="COMPLETED"||stage2Version<1)return Response.json({error:"请先完成当前 Sourcing Run 的商品与 SKU 解析"},{status:409});
+ const keywords=Array.isArray(run.keywords)?run.keywords.map(String):[],directions=buildProductDirections(sourceProductsFromRows((rows??[])as Record<string,unknown>[]),{taskName:String(run.query??""),searchKeywords:keywords}),primary=directions.filter(item=>item.taskRelevance==="PRIMARY");
+ if(!primary.length)return Response.json({error:"当前任务没有可复核的 PRIMARY 商品方向，请先检查商品解析与任务相关性"},{status:422});
+ const productEvidence=(product:ProductDirection["products"][number]|undefined)=>product?{sourceProductId:product.id,sourceOfferId:product.sourceOfferId,name:product.normalizedName,supplier:product.supplier_name,dropshipping:product.supports_dropshipping,privacyDropshipping:product.supports_privacy_dropshipping,offerSales:product.sales_count,dataConfidence:product.confidence,knownIssues:product.data_issues,skus:product.skus.filter(isTrustedPrice).map(s=>({sourceSkuId:s.id,spec:s.specName,dropshipPrice:s.dropshipPrice,dropshipMoq:s.dropshipMoq,shippingFee:s.shippingFee,promotionDiscount:s.promotionDiscount,priceStatus:s.priceStatus,landedCost:s.landedCost}))}:null;
+ const compact=primary.slice(0,parsed.data.limit).map(d=>({directionId:d.id,name:d.name,taskRelevance:d.taskRelevance,relevanceReason:d.taskRelevanceReason,productCount:d.productCount,skuCount:d.skuCount,commercialReadiness:d.commercialReadiness,rulePreScore:d.ruleScore,dataConfidence:d.dataConfidence,offerSalesEvidence:d.maxOfferSales,skuSales:"UNKNOWN",recommended:productEvidence(d.products.find(x=>x.id===d.representativeProductId)),lowestPrice:productEvidence(d.products.find(x=>x.id===d.lowestPriceProductId)),alternative:productEvidence(d.products.find(x=>x.id===d.alternativeProductId)),representativeReason:d.representativeReason}));
+ const inputSnapshot={sourcingRunId:run.id,stage2Version,taskName:run.query,keywords,promptVersion:PROMPT_VERSION,directions:compact},inputHash=createHash("sha256").update(JSON.stringify(inputSnapshot)).digest("hex");
+ const prompt=`你是谨慎的淘宝猫用品选品经理。只评审输入中的 PRIMARY 商品方向。最多给3个 PRIORITY_VERIFY，其余必须是 VERIFY/WATCH/REJECT。方向价值与经营就绪度分开判断；commercialReadiness 是程序确定性检查，不得被你改写。每条结论必须引用输入中真实可见的证据；Offer销量不得冒充SKU销量；缺失数据写入 uncertainties 或 blockers；不得编造市场规模、利润或供应商能力。即使 WATCH/REJECT 也必须输出完整字段。不同方向的 summary 与 nextAction 必须具体且不同。输出JSON {"summary":"","directions":[{"directionId":"","recommendation":"PRIORITY_VERIFY|VERIFY|WATCH|REJECT","directionScore":0,"confidence":"LOW|MEDIUM|HIGH","summary":"","evidence":[""],"hypotheses":[""],"uncertainties":[""],"blockers":[""],"nextAction":""}]}。证据=${JSON.stringify(compact)}`;
+ const base=(process.env.OPENAI_BASE_URL||"https://api.deepseek.com").replace(/\/$/,""),response=await fetch(`${base}/chat/completions`,{method:"POST",headers:{Authorization:`Bearer ${process.env.OPENAI_API_KEY}`,"Content-Type":"application/json"},body:JSON.stringify({model:process.env.OPENAI_MODEL,messages:[{role:"system",content:"只输出合法JSON。所有结论必须能追溯到提供的证据，未知即未知。"},{role:"user",content:prompt}],response_format:{type:"json_object"},max_tokens:5000,thinking:{type:"disabled"}}),signal:AbortSignal.timeout(120000)}),body=await response.json();
+ if(!response.ok)return Response.json({error:body.error?.message??"AI请求失败"},{status:502});let value:unknown;try{value=JSON.parse(body.choices?.[0]?.message?.content??"")}catch{return Response.json({error:"AI未返回合法JSON"},{status:502})}
+ const parsedOutput=outputSchema.safeParse(value);if(!parsedOutput.success)return Response.json({error:"AI方向结果校验失败",details:parsedOutput.error.flatten()},{status:502});
+ const byId=new Map(parsedOutput.data.directions.map(item=>[item.directionId,item])),reviewedAt=new Date().toISOString(),reviewId=randomUUID();let priorityCount=0;
+ const reviewed=directions.map(direction=>{const ai=byId.get(direction.id);if(direction.taskRelevance!=="PRIMARY")return{...direction,recommendation:"WATCH" as const,directionScore:direction.ruleScore,aiScore:direction.ruleScore,confidence:"MEDIUM" as const,summary:"邻近机会，已与当前主任务隔离",evidence:[direction.taskRelevanceReason],hypotheses:[],uncertainties:["需建立独立任务后再完成方向级市场判断"],blockers:["不属于当前任务 PRIMARY 范围"],nextAction:"创建独立货源发现任务草稿",reviewedAt,reviewId,promptVersion:PROMPT_VERSION,status:"WATCH" as const};let recommendation:DirectionRecommendation=ai?.recommendation??"WATCH";if(recommendation==="PRIORITY_VERIFY"&&priorityCount++>=3)recommendation="VERIFY";const result=ai??{directionScore:direction.ruleScore,confidence:"LOW" as const,summary:"DeepSeek 未返回该方向",evidence:["规则预评分与商品解析记录"],hypotheses:[],uncertainties:["AI 结果缺失"],blockers:["需要重新复核"],nextAction:"重新运行方向复核"};return{...direction,...result,recommendation,aiScore:result.directionScore,marketReason:result.summary,differentiationReason:result.evidence.join("；"),mainRisk:result.blockers[0]??result.uncertainties[0]??"暂无明确阻断项",verificationNeeded:[...result.uncertainties,...result.blockers],reviewedAt,reviewId,promptVersion:PROMPT_VERSION,status:recommendation==="PRIORITY_VERIFY"?"RECOMMENDED":recommendation==="REJECT"?"REJECTED":"WATCH"} as ProductDirection}).sort((a,b)=>(priority[b.recommendation!]-priority[a.recommendation!])||(b.directionScore??0)-(a.directionScore??0)||b.ruleScore-a.ruleScore);
+ const persisted=reviewed.map(direction=>({...direction,products:undefined})),review={reviewId,version:4,granularity:"SOURCE_PRODUCT",sourcingRunId:run.id,stage2Version,promptVersion:PROMPT_VERSION,inputHash,inputSnapshot,status:"COMPLETED",summary:parsedOutput.data.summary,reviewedAt,model:body.model,directions:persisted},oldHistory=Array.isArray(oldCriteria.directionReviewHistory)?oldCriteria.directionReviewHistory:[],criteria={...oldCriteria,pipeline:{...pipeline,stage3Status:"COMPLETED",stage3Version:Number(pipeline.stage3Version??0)+1,stage3CompletedAt:reviewedAt,stage3InputStage2Version:stage2Version},directionReview:review,directionReviewHistory:[...oldHistory,review].slice(-10)};
+ const {error:persistError}=await db.from("sourcing_runs").update({criteria}).eq("id",run.id).eq("user_id",auth.user.id);if(persistError)return Response.json({error:persistError.message},{status:500});
+ await db.from("source_products").update({selected:false,ai_rank:null}).eq("sourcing_run_id",run.id);
+ const top=reviewed.filter(item=>item.taskRelevance==="PRIMARY"&&item.recommendation==="PRIORITY_VERIFY").slice(0,3);await Promise.all(top.map((direction,index)=>db.from("source_products").update({selected:true,ai_rank:index+1,ai_score:direction.directionScore,ai_reason:direction.summary,ai_risks:[...(direction.uncertainties??[]),...(direction.blockers??[])]}).eq("id",direction.products.find(product=>product.id===direction.representativeProductId)?.sourceOfferId??"")));
+ return Response.json({sourcingRunId:run.id,reviewId,summary:parsedOutput.data.summary,directions:reviewed,top,reviewedAt,model:body.model,promptVersion:PROMPT_VERSION,inputHash});
 }

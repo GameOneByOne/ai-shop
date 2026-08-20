@@ -60,3 +60,7 @@ pnpm build
 - 单变量实验及 before/after 指标快照。
 
 AI 功能始终由用户主动触发，结果保存审计记录；客服内容只生成草稿，不自动发送。
+
+## 1688 浏览器扩展
+
+SourceSKU 的解析范围、组合方式、附加服务排除规则和验收清单见 [1688 SourceSKU 解析规则](docs/1688-source-sku-parser.md)。修改解析器后运行 `pnpm test:parser`，并提升扩展版本号。

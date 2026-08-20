@@ -50,22 +50,46 @@ export async function POST(request: Request) {
     );
   }
 
+  const { data: profile } = await db
+    .from("store_profiles")
+    .select("min_purchase_price,max_purchase_price,target_gross_margin,default_moq_max,min_supplier_repurchase_rate,default_shipping_cost,default_packaging_cost")
+    .eq("user_id", auth.user.id)
+    .maybeSingle();
   const criteria = {
-    priceRange: [2, 30],
-    maxMoq: 10,
-    minMarginRate: 0.4,
+    priceRange: [Number(profile?.min_purchase_price ?? 2), Number(profile?.max_purchase_price ?? 30)],
+    maxMoq: Number(profile?.default_moq_max ?? 5),
+    minMarginRate: Number(profile?.target_gross_margin ?? .45),
     minUnitProfit: 5,
-    minRepurchaseRate: 20,
-    shippingAssumption: 3,
-    packagingAssumption: 0.5,
+    minRepurchaseRate: Number(profile?.min_supplier_repurchase_rate ?? 20),
+    shippingAssumption: Number(profile?.default_shipping_cost ?? 3),
+    packagingAssumption: Number(profile?.default_packaging_cost ?? .5),
     afterSalesReserve: 0.5,
     platformAndPromotionRate: 0.16,
+    pipeline: {
+      stage1Status: "COMPLETED",
+      stage1Version: 1,
+      stage1CompletedAt: new Date().toISOString(),
+      stage2Status: "NOT_RUN",
+      stage2Version: 0,
+      stage3Status: "NOT_RUN",
+    },
   };
   const rawFetched = parsed.data.collection.pageStats.reduce(
     (sum, page) => sum + Number(page.found || 0),
     0,
   );
-  const evaluated = evaluateProducts(relevant);
+  const evaluated = evaluateProducts(relevant, {
+    minPurchasePrice: criteria.priceRange[0],
+    maxPreferredPurchasePrice: criteria.priceRange[1],
+    maxPreferredMoq: criteria.maxMoq,
+    targetMarginRate: criteria.minMarginRate,
+    minUnitProfit: criteria.minUnitProfit,
+    preferredRepurchaseRate: criteria.minRepurchaseRate,
+    shippingAssumption: criteria.shippingAssumption,
+    packagingAssumption: criteria.packagingAssumption,
+    afterSalesReserve: criteria.afterSalesReserve,
+    platformAndPromotionRate: criteria.platformAndPromotionRate,
+  });
   const eligible = evaluated.filter(
     (item) => ["valid", "needs_review"].includes(item.dataStatus) && item.clusterRank === 1,
   );

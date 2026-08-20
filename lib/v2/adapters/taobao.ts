@@ -1,0 +1,3 @@
+import type{TaobaoProduct,TaobaoSku}from"../domain";
+export interface TaobaoAdapter{createDraft(input:{title:string;skuCode:string;spec:string;salePrice:number}):Promise<{product:TaobaoProduct;sku:TaobaoSku}>}
+export class MockTaobaoAdapter implements TaobaoAdapter{async createDraft(input:{title:string;skuCode:string;spec:string;salePrice:number}):Promise<{product:TaobaoProduct;sku:TaobaoSku}>{const id=`draft-product-${Date.now()}`;return{product:{id,title:input.title,status:"PAUSED"},sku:{id:`draft-sku-${Date.now()}`,productId:id,code:input.skuCode,spec:input.spec,salePrice:input.salePrice,status:"PAUSED"}}}}

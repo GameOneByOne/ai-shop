@@ -1,36 +1,1026 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
+import type {
+  DirectionRecommendation,
+  DirectionSourceProduct,
+  ProductDirection,
+} from "@/lib/sourcing/directions";
+import {
+  isTrustedPrice,
+  type SourceSkuRecord,
+} from "@/lib/sourcing/source-products";
 
-type Breakdown = { profit:number; demand:number; supplier:number; afterSales:number; storeFit:number; competition:number; differentiation:number };
-interface Item { id:string; title:string; source_url:string; price_min:number|null; minimum_order_quantity:number|null; sales_count:number|null; repurchase_rate:number|null; return_shipping:boolean; pay_later:boolean; dropshipping:boolean; cluster_key:string|null; cluster_rank:number|null; data_status:"valid"|"needs_review"|"data_error"|"rejected"; data_issues:string[]; rejected_reasons:string[]; rough_score:number; score_breakdown:Breakdown; estimated_sale_price_min:number|null; estimated_sale_price_max:number|null; estimated_unit_profit_min:number|null; estimated_unit_profit_max:number|null; decision_status:"pending"|"candidate"|"ignored" }
-interface Pick { id:string; score:number; ruleScore:number; qualitativeScore:number; reason:string; risks:string[]; checks:string[]; scoreBreakdown:Breakdown }
-interface Stats { fetched:number; unique:number; pages:number; relevant:number; dataErrors:number; rejected:number; clusters:number; eligible:number }
+interface Item {
+  id: string;
+  external_id: string;
+  source_url: string;
+  title: string;
+  supplier_name: string | null;
+  price_min: number | null;
+  sales_count: number | null;
+  repurchase_rate: number | null;
+  rough_score: number;
+  data_status: string;
+  raw_data: Record<string, unknown>;
+  one_piece_delivery?: boolean | null;
+  min_order_quantity?: number | null;
+  blind_shipping?: boolean | null;
+  return_shipping?: boolean | null;
+  no_reason_return?: boolean | null;
+  shop_age?: number | null;
+  quality_rate?: number | null;
+  delivery_rate?: number | null;
+  stock?: number | null;
+  image_count?: number | null;
+  has_video?: boolean | null;
+  inspection?: boolean | null;
+  offer_status?: "PASS" | "RISK" | "REJECT" | null;
+  offer_reasons?: string[] | null;
+  offer_facts_captured_at?: string | null;
+}
+
+interface Stats {
+  fetched: number;
+  unique: number;
+  pages: number;
+  sourceProducts: number;
+  sourceSkus: number;
+  dataErrors: number;
+  rejected: number;
+  clusters: number;
+  eligible: number;
+  primaryDirections?: number;
+  adjacentDirections?: number;
+}
+
+interface Pipeline {
+  stage1Status: string;
+  stage1Version: number;
+  stage2Status: string;
+  stage2Version: number;
+  stage3Status: string;
+}
+
+type CaptureMode = "offers" | "facts" | "details";
+
+type StageState = "NOT_RUN" | "COMPLETED" | "STALE";
+
+function isReviewDone(direction: ProductDirection) {
+  return Boolean(direction.reviewedAt && direction.recommendation);
+}
+
+function labelRecommendation(
+  value: DirectionRecommendation | null | undefined,
+) {
+  return {
+    PRIORITY_VERIFY: "优先验证",
+    VERIFY: "需要验证",
+    WATCH: "观察",
+    REJECT: "不建议",
+  }[value ?? "WATCH"];
+}
+
+function stageText(state: StageState) {
+  if (state === "COMPLETED") return "✓ 完成";
+  if (state === "STALE") return "⚠ 需刷新";
+  return "待运行";
+}
+
+function stageValue(state: StageState) {
+  if (state === "COMPLETED") return "COMPLETED";
+  if (state === "STALE") return "STALE";
+  return "NOT_RUN";
+}
+
+function formatMoney(value: number | null | undefined) {
+  return value == null ? "待核实" : `¥${value.toFixed(2)}`;
+}
+
+function directionPriceRange(direction: ProductDirection) {
+  const candidatePrices = direction.products
+    .flatMap((p) => p.skus)
+    .map((s) =>
+      isTrustedPrice(s) ? (s.dropshipPrice ?? s.wholesalePrice) : null,
+    )
+    .filter((value): value is number => value != null);
+
+  if (!candidatePrices.length) return "待核实";
+
+  const min = Math.min(...candidatePrices);
+  const max = Math.max(...candidatePrices);
+  return min === max
+    ? `¥${min.toFixed(2)}`
+    : `¥${min.toFixed(2)} ~ ¥${max.toFixed(2)}`;
+}
+
+function directionCoverage(direction: ProductDirection) {
+  const totalSku = direction.skuCount || 0;
+  const trustedSku = direction.products
+    .flatMap((product) => product.skus)
+    .filter((sku) => isTrustedPrice(sku)).length;
+  const verifiedOffer = direction.products.filter(
+    (product) =>
+      product.supports_dropshipping === true &&
+      product.skus.some((sku) => isTrustedPrice(sku)),
+  ).length;
+
+  return { totalSku, trustedSku, verifiedOffer };
+}
+
+function stageSummary(pipeline: Pipeline | null) {
+  if (!pipeline) return [];
+  return [
+    {
+      step: "① 货源粗筛",
+      status: stageText(pipeline.stage1Status as StageState),
+      value:
+        pipeline.stage1Status === "COMPLETED"
+          ? "1688 搜索结果已采集"
+          : "等待运行粗筛",
+      state: stageValue(pipeline.stage1Status as StageState),
+    },
+    {
+      step: "② 商品解析",
+      status: stageText(pipeline.stage2Status as StageState),
+      value:
+        pipeline.stage2Status === "COMPLETED"
+          ? `Offer 与 SKU 已解析 · v${pipeline.stage2Version}`
+          : "等待解析商品",
+      state: stageValue(pipeline.stage2Status as StageState),
+    },
+  ];
+}
 
 export function SourcingDiscovery() {
-  const [query,setQuery]=useState("猫咪去毛清洁用品");
-  const [keywordText,setKeywordText]=useState("宠物去毛器\n猫毛清理器\n沙发除猫毛\n宠物除毛刷");
-  const [items,setItems]=useState<Item[]>([]);
-  const [runId,setRunId]=useState("");
-  const [picks,setPicks]=useState<Pick[]>([]);
-  const [stats,setStats]=useState<Stats|null>(null);
-  const [collecting,setCollecting]=useState(false);
-  const [reviewing,setReviewing]=useState(false);
-  const captureTimer=useRef<ReturnType<typeof setTimeout>|null>(null);
-  const captureRequestId=useRef<string|null>(null);
-  const [error,setError]=useState("");
-  async function post(url:string,data:object){const response=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});const body=await response.json();if(!response.ok)throw new Error(body.error??"操作失败");return body}
-  useEffect(()=>{void fetch("/api/sourcing/latest").then(async response=>{const body=await response.json();if(!response.ok)throw new Error(body.error??"读取最近任务失败");if(!body.runId)return;setRunId(body.runId);setItems(body.products??[]);setPicks(body.picks??[]);setStats(body.stats);if(body.query)setQuery(body.query);if(body.keywords?.length)setKeywordText(body.keywords.join("\n"))}).catch(reason=>setError(reason.message))},[]);
-  useEffect(()=>{const receive=(event:MessageEvent)=>{if(event.origin!==location.origin||event.data?.type!=="AI_SHOP_CAPTURE_RESULT"||event.data.requestId!==captureRequestId.current)return;if(captureTimer.current)clearTimeout(captureTimer.current);captureTimer.current=null;captureRequestId.current=null;if(event.data.error){setCollecting(false);setError(event.data.error);return}const keywords=keywordText.split(/[\n,，]/).map(value=>value.trim()).filter(Boolean).slice(0,5);void post("/api/sourcing/browser-import",{query,keywords,collection:event.data.collection,items:event.data.items}).then(body=>{setItems(body.products??[]);setRunId(body.runId);setStats(body.stats);setPicks([])}).catch(reason=>setError(reason.message)).finally(()=>setCollecting(false))};window.addEventListener("message",receive);return()=>window.removeEventListener("message",receive)},[query,keywordText]);
-  useEffect(()=>()=>{if(captureTimer.current)clearTimeout(captureTimer.current)},[]);
-  function capture(){const keywords=keywordText.split(/[\n,，]/).map(value=>value.trim()).filter(Boolean).slice(0,5);if(keywords.length<3){setError("每个品类请填写 3～5 个关键词");return}const requestId=crypto.randomUUID();captureRequestId.current=requestId;setCollecting(true);setError("");window.postMessage({type:"AI_SHOP_CAPTURE_1688",requestId,query,keywords,maxPages:3},location.origin);captureTimer.current=setTimeout(()=>{captureRequestId.current=null;captureTimer.current=null;setCollecting(false);setError("采集超时；最多 5 个关键词 × 3 页，请检查 1688 标签页后重试")},180000)}
-  async function review(){setReviewing(true);setError("");try{const body=await post("/api/sourcing/shortlist",{runId,limit:20});setPicks(body.items??[])}catch(reason){setError(reason instanceof Error?reason.message:"细筛失败")}finally{setReviewing(false)}}
-  async function decide(id:string,action:"candidate"|"ignored"){try{await post("/api/sourcing/decision",{id,action});setItems(current=>current.map(item=>item.id===id?{...item,decision_status:action}:item))}catch(reason){setError(reason instanceof Error?reason.message:"操作失败")}}
-  const byId=useMemo(()=>new Map(items.map(item=>[item.id,item])),[items]);
-  return <>
-    <section className="card"><h2>品类选品任务</h2><p className="muted">每个关键词最多 3 页；串行低频抓取，跨页去重；新增有效商品率低于 15% 或没有新类型时自动停止。</p><div className="sourcing-task-form"><label>任务名称<input className="input" value={query} onChange={event=>setQuery(event.target.value)}/></label><label>搜索关键词（每行一个，3～5 个）<textarea className="input textarea" value={keywordText} onChange={event=>setKeywordText(event.target.value)}/></label><div className="auth-actions"><button type="button" className="btn" disabled={collecting||reviewing} onClick={capture}>{collecting?"正在低频采集…":"开始品类采集"}</button>{runId&&<button type="button" className="secondary-btn" disabled={collecting||reviewing||!stats?.eligible} onClick={()=>void review()}>{reviewing?"DeepSeek 复核中…":"DeepSeek 复核（最多20个方向）"}</button>}</div></div>{error&&<div className="status-box error">{error}</div>}</section>
-    {stats&&<div className="sourcing-stats"><div><b>{stats.pages}</b><span>实际页数</span></div><div><b>{stats.fetched}</b><span>原始 listing</span></div><div><b>{stats.unique}</b><span>跨词去重后</span></div><div><b>{stats.dataErrors+stats.rejected}</b><span>异常/硬淘汰</span></div><div><b>{stats.clusters}</b><span>商品方向</span></div><div><b>{stats.eligible}</b><span>可供 AI 复核</span></div></div>}
-    {picks.map((pick,index)=>{const item=byId.get(pick.id);if(!item)return null;const b=item.score_breakdown;return <article className="card sourcing-card" key={pick.id}><div className="sourcing-card-head"><div><span className="eyebrow">#{index+1} · {item.cluster_key}</span><h2>{item.title}</h2></div><div className="sourcing-score"><b>{pick.score}</b><span>综合分</span></div></div><div className="sourcing-economics"><div><span>采购</span><b>{item.price_min==null?"待核实":`¥${item.price_min}`}</b><small>MOQ {item.minimum_order_quantity??"待核实"}</small></div><div><span>预计售价</span><b>¥{item.estimated_sale_price_min}～{item.estimated_sale_price_max}</b><small>含运费/包装/推广/售后预留</small></div><div><span>预计单件利润</span><b>¥{item.estimated_unit_profit_min}～{item.estimated_unit_profit_max}</b><small>目标利润≥¥5、利润率≥40%</small></div></div><div className="sourcing-columns"><div><h3>核心指标</h3><p>销量：{item.sales_count??"待核实"}　回头率：{item.repurchase_rate==null?"待核实":`${item.repurchase_rate}%`}</p><p>退货包运费：{item.return_shipping?"✓":"待核实"}　先采后付：{item.pay_later?"✓":"待核实"}　一件代发：{item.dropshipping?"✓":"待核实"}</p><h3>规则评分</h3><div className="score-grid"><span>利润 {b.profit}/25</span><span>销量 {b.demand}/15</span><span>供应商 {b.supplier}/20</span><span>售后 {b.afterSales}/10</span><span>店铺匹配 {b.storeFit}/15</span><span>竞争 {b.competition}/10</span><span>差异化 {b.differentiation}/5</span></div></div><div><h3>AI 判断</h3><p>{pick.reason}</p><p><b>风险：</b>{pick.risks.join("；")}</p><p><b>人工复核：</b>{pick.checks.join("；")}</p></div></div><div className="sourcing-actions"><a className="text-link" href={item.source_url} target="_blank" rel="noreferrer">查看 1688 详情</a><button className="secondary-btn" disabled={item.decision_status==="ignored"} onClick={()=>void decide(item.id,"ignored")}>{item.decision_status==="ignored"?"已忽略":"忽略"}</button><button className="btn" disabled={item.decision_status==="candidate"} onClick={()=>void decide(item.id,"candidate")}>{item.decision_status==="candidate"?"已加入选品池":"加入选品池"}</button></div></article>})}
-    {items.length>0&&<div className="card table-wrap"><h2>清洗与硬过滤明细</h2><table className="table"><thead><tr><th>商品/聚类</th><th>数据状态</th><th>采购价</th><th>销量/回头率</th><th>规则分</th><th>问题</th></tr></thead><tbody>{items.map(item=><tr key={item.id}><td><a href={item.source_url} target="_blank" rel="noreferrer">{item.title}</a><br/><small>{item.cluster_key} · 类内#{item.cluster_rank}</small></td><td><span className={`data-state ${item.data_status}`}>{item.data_status.toUpperCase()}</span></td><td>{item.price_min==null?"—":`¥${item.price_min}`}<br/><small>MOQ {item.minimum_order_quantity??"—"}</small></td><td>{item.sales_count??"—"}<br/><small>{item.repurchase_rate==null?"—":`${item.repurchase_rate}%`}</small></td><td>{item.data_status==="valid"?item.rough_score:"—"}</td><td>{[...(item.data_issues||[]),...(item.rejected_reasons||[])].join("；")||"—"}</td></tr>)}</tbody></table></div>}
-  </>;
+  const [query, setQuery] = useState("猫隧道");
+  const [keywordText, setKeywordText] = useState(
+    "猫隧道\n猫咪隧道\n宠物隧道\n可折叠猫隧道\n猫玩具隧道",
+  );
+  const [items, setItems] = useState<Item[]>([]);
+  const [directions, setDirections] = useState<ProductDirection[]>([]);
+  const [runId, setRunId] = useState("");
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [pipeline, setPipeline] = useState<Pipeline | null>(null);
+  const [busy, setBusy] = useState<CaptureMode | null>(null);
+  const [progress, setProgress] = useState("");
+  const [captureProgress, setCaptureProgress] = useState<{
+    completed: number;
+    total: number;
+    succeeded: number;
+    failed: number;
+  } | null>(null);
+  const [error, setError] = useState("");
+  const [filter, setFilter] = useState("ALL");
+  const [sort, setSort] = useState("score");
+  const [requirements, setRequirements] = useState({
+    onePiece: false,
+    blind: false,
+    returns: false,
+    stock: false,
+    shopAge: false,
+  });
+
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const requestRef = useRef<string | null>(null);
+  const modeRef = useRef<CaptureMode>("offers");
+
+  async function post(url: string, data: object) {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error ?? "操作失败");
+    return body;
+  }
+
+  async function loadLatest() {
+    const response = await fetch("/api/sourcing/latest");
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error ?? "读取最近任务失败");
+    if (!body.runId) return;
+
+    setRunId(body.runId);
+    setItems(body.products ?? []);
+    setDirections(body.directions ?? []);
+    setStats(body.stats);
+    setPipeline(body.pipeline ?? null);
+    if (body.query) setQuery(body.query);
+    if (body.keywords?.length) setKeywordText(body.keywords.join("\n"));
+  }
+
+  useEffect(() => {
+    let active = true;
+    void fetch("/api/sourcing/latest")
+      .then(async (response) => {
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error ?? "读取最近任务失败");
+        if (!active || !body.runId) return;
+
+        setRunId(body.runId);
+        setItems(body.products ?? []);
+        setDirections(body.directions ?? []);
+        setStats(body.stats);
+        setPipeline(body.pipeline ?? null);
+        if (body.query) setQuery(body.query);
+        if (body.keywords?.length) setKeywordText(body.keywords.join("\n"));
+      })
+      .catch((e) => {
+        if (active) setError(e.message);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const receive = (event: MessageEvent) => {
+      if (
+        event.origin !== location.origin ||
+        event.data.requestId !== requestRef.current
+      )
+        return;
+      if (event.data?.type === "AI_SHOP_CAPTURE_PROGRESS") {
+        setCaptureProgress({
+          completed: Number(event.data.completed ?? 0),
+          total: Number(event.data.total ?? 0),
+          succeeded: Number(event.data.succeeded ?? 0),
+          failed: Number(event.data.failed ?? 0),
+        });
+        setProgress(
+          `已处理 ${event.data.completed}/${event.data.total} 个 Offer（成功 ${event.data.succeeded}，失败 ${event.data.failed}）`,
+        );
+        return;
+      }
+      if (event.data?.type !== "AI_SHOP_CAPTURE_RESULT") return;
+      if (timer.current) clearTimeout(timer.current);
+      requestRef.current = null;
+      const completedMode = modeRef.current;
+      if (event.data.error) {
+        setBusy(null);
+        setCaptureProgress(null);
+        setError(event.data.error);
+        return;
+      }
+      const keywords = keywordText
+        .split(/[\n,，]/)
+        .map((x) => x.trim())
+        .filter(Boolean)
+        .slice(0, 5);
+      const operation =
+        completedMode === "offers"
+          ? post("/api/sourcing/browser-import", {
+              query,
+              keywords,
+              collection: event.data.collection,
+              items: event.data.items,
+            })
+          : post("/api/sourcing/enrich", {
+              runId,
+              details: event.data.details,
+              factsOnly: completedMode === "facts",
+            });
+
+      void operation
+        .then(async (body) => {
+          await loadLatest();
+          if (completedMode === "offers") {
+            startDetailCapture(body.products ?? [], body.runId, "facts");
+            return;
+          }
+          const failedCount = Array.isArray(event.data.failures)
+            ? event.data.failures.length
+            : 0;
+          if (failedCount > 0) {
+            setError(
+              `${failedCount} 个商家详情未解析成功，请检查1688登录状态后重新解析。`,
+            );
+            return;
+          }
+        })
+        .catch((e: unknown) => {
+          setError(e instanceof Error ? e.message : "同步数据失败");
+        })
+        .finally(() => {
+          if (modeRef.current !== completedMode) return;
+          setBusy(null);
+          setCaptureProgress(null);
+          setProgress("");
+        });
+    };
+
+    window.addEventListener("message", receive);
+    return () => window.removeEventListener("message", receive);
+  }, [keywordText, query, runId]);
+
+  useEffect(
+    () => () => {
+      if (timer.current) clearTimeout(timer.current);
+    },
+    [],
+  );
+
+  function matchesRequirements(item: Item) {
+    if (requirements.onePiece && item.one_piece_delivery !== true) return false;
+    if (requirements.blind && item.blind_shipping !== true) return false;
+    if (
+      requirements.returns &&
+      item.return_shipping !== true &&
+      item.no_reason_return !== true
+    )
+      return false;
+    if (requirements.stock && (item.stock ?? 0) <= 100) return false;
+    if (requirements.shopAge && (item.shop_age ?? 0) <= 1) return false;
+    return true;
+  }
+
+  function startDetailCapture(
+    sourceItems: Item[],
+    targetRunId: string,
+    captureMode: "facts" | "details",
+  ) {
+    const parseCandidates = sourceItems
+      .filter((x) =>
+        captureMode === "facts"
+          ? ["valid", "needs_review"].includes(x.data_status)
+          : x.offer_status === "PASS" && matchesRequirements(x),
+      )
+      .sort((a, b) => b.rough_score - a.rough_score)
+      .slice(0, 50)
+      .map((x) => ({
+        id: x.id,
+        externalId: x.external_id,
+        sourceUrl: x.source_url,
+        title: x.title,
+      }));
+
+    if (!parseCandidates.length) {
+      setBusy(null);
+      setError(
+        captureMode === "facts"
+          ? "本次搜索没有可采集资质的 Offer"
+          : "当前筛选条件下没有通过准入的 Offer",
+      );
+      return;
+    }
+
+    const id = crypto.randomUUID();
+    requestRef.current = id;
+    modeRef.current = captureMode;
+    setRunId(targetRunId);
+    setBusy(captureMode);
+    setDirections([]);
+    setProgress(
+      captureMode === "facts"
+        ? "正在采集 Offer 与店铺资质并执行准入筛选…"
+        : "正在解析筛选通过的商品与采购 SKU…",
+    );
+    setCaptureProgress({
+      completed: 0,
+      total: parseCandidates.length,
+      succeeded: 0,
+      failed: 0,
+    });
+
+    window.postMessage(
+      {
+        type: "AI_SHOP_ENRICH_1688",
+        requestId: id,
+        offers: parseCandidates,
+        factsOnly: captureMode === "facts",
+      },
+      location.origin,
+    );
+
+    timer.current = setTimeout(() => {
+      requestRef.current = null;
+      setBusy(null);
+      setCaptureProgress(null);
+      setProgress("");
+      setError(
+        captureMode === "facts"
+          ? "店铺资质采集超时，请检查 1688 登录状态后重新搜索"
+          : "商品解析超时，请检查采集桥状态后重试",
+      );
+    }, 480000);
+  }
+
+  function begin(mode: CaptureMode) {
+    const keywords = keywordText
+      .split(/[\n,，]/)
+      .map((x) => x.trim())
+      .filter(Boolean)
+      .slice(0, 5);
+    if (mode === "offers" && keywords.length < 3) {
+      setError("每个品类请填写 3～5 个关键词");
+      return;
+    }
+
+    const id = crypto.randomUUID();
+    requestRef.current = id;
+    modeRef.current = mode;
+    setBusy(mode);
+    setCaptureProgress({
+      completed: 0,
+      total:
+        mode === "details"
+          ? Math.min(
+              50,
+              items.filter((x) =>
+                ["valid", "needs_review"].includes(x.data_status),
+              ).length,
+            )
+          : keywordText
+              .split(/[\n,，]/)
+              .map((x) => x.trim())
+              .filter(Boolean)
+              .slice(0, 5).length,
+      succeeded: 0,
+      failed: 0,
+    });
+
+    if (mode === "offers") {
+      setDirections([]);
+      setStats(null);
+      setPipeline(null);
+      setProgress("正在创建新的 Sourcing Run 并进行 Offer 粗筛…");
+    } else {
+      setDirections([]);
+      setProgress("正在解析 Offer 的真实商品与 SKU…");
+    }
+    setError("");
+
+    if (mode === "offers") {
+      window.postMessage(
+        {
+          type: "AI_SHOP_CAPTURE_1688",
+          requestId: id,
+          query,
+          keywords,
+          maxPages: 3,
+        },
+        location.origin,
+      );
+    } else {
+      startDetailCapture(items, runId, "details");
+      return;
+    }
+
+    timer.current = setTimeout(
+      () => {
+        requestRef.current = null;
+        setBusy(null);
+        setCaptureProgress(null);
+        setProgress("");
+        setError(
+          mode === "offers"
+            ? "Offer 采集超时，请检查 1688 登录状态"
+            : "解析超时，请检查采集桥状态",
+        );
+      },
+      mode === "offers" ? 180000 : 480000,
+    );
+  }
+
+  const allPrimary = useMemo(
+    () => directions.filter((x) => x.taskRelevance === "PRIMARY"),
+    [directions],
+  );
+  const adjacent = useMemo(
+    () => directions.filter((x) => x.taskRelevance === "ADJACENT_OPPORTUNITY"),
+    [directions],
+  );
+  const sortedAudit = useMemo(() => {
+    let list = [...items];
+    if (filter !== "ALL") list = list.filter((x) => x.offer_status === filter);
+    if (requirements.onePiece)
+      list = list.filter((x) => x.one_piece_delivery === true);
+    if (requirements.blind)
+      list = list.filter((x) => x.blind_shipping === true);
+    if (requirements.returns)
+      list = list.filter(
+        (x) => x.return_shipping === true || x.no_reason_return === true,
+      );
+    if (requirements.stock) list = list.filter((x) => (x.stock ?? 0) > 100);
+    if (requirements.shopAge) list = list.filter((x) => (x.shop_age ?? 0) > 1);
+    if (sort === "sales") {
+      list.sort((a, b) => (b.sales_count ?? 0) - (a.sales_count ?? 0));
+    } else if (sort === "price") {
+      list.sort(
+        (a, b) => (a.price_min ?? Infinity) - (b.price_min ?? Infinity),
+      );
+    } else {
+      list.sort((a, b) => (b.rough_score ?? 0) - (a.rough_score ?? 0));
+    }
+    return list;
+  }, [filter, items, requirements, sort]);
+
+  const admission = useMemo(() => {
+    const captured = items.filter((x) => Boolean(x.offer_facts_captured_at));
+    return {
+      captured: items.length,
+      pass: captured.filter((x) => x.offer_status === "PASS").length,
+      risk: captured.filter((x) => x.offer_status === "RISK").length,
+      reject: captured.filter((x) => x.offer_status === "REJECT").length,
+      pending: items.length - captured.length,
+    };
+  }, [items]);
+
+  const stageSteps = stageSummary(pipeline).map((step, index) =>
+    busy === "details" && index === 1
+      ? {
+          ...step,
+          status: "解析中",
+          value: "正在逐个读取子产品、价格、库存和图片",
+          state: "PROCESSING",
+        }
+      : step,
+  );
+
+  return (
+    <>
+      <section className="sourcing-task-form">
+        <h2>选品任务工作台</h2>
+        <label>
+          任务名称
+          <input
+            className="input"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </label>
+        <label>
+          搜索关键词（每行一个，3～5 个）
+          <textarea
+            className="input textarea"
+            value={keywordText}
+            onChange={(e) => setKeywordText(e.target.value)}
+          />
+        </label>
+        <div className="auth-actions">
+          <button
+            className={busy === "details" ? "secondary-btn" : "btn"}
+            disabled={Boolean(busy)}
+            onClick={() => begin("offers")}
+          >
+            {busy === "offers"
+              ? "正在搜索 1688 货源…"
+              : stats
+                ? "重新搜索 1688 货源"
+                : "1. 搜索 1688 货源"}
+          </button>
+          <button
+            className={busy === "details" ? "btn" : "secondary-btn"}
+            disabled={!runId || Boolean(busy) || !items.length}
+            onClick={() => begin("details")}
+          >
+            {busy === "details"
+              ? `正在解析 ${captureProgress?.completed ?? 0}/${captureProgress?.total ?? 0}`
+              : "2. 解析通过筛选的商品与 SKU"}
+          </button>
+        </div>
+
+        {pipeline && (
+          <div className="stepper">
+            {stageSteps.map((item) => (
+              <div
+                className={`stepper-item ${item.state.toLowerCase()}`}
+                key={item.step}
+              >
+                <div>
+                  <b>{item.step}</b>
+                  <span>{item.status}</span>
+                </div>
+                <small>{item.value}</small>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {busy && captureProgress && (
+          <div className="capture-progress" aria-live="polite">
+            <div>
+              <b>
+                {busy === "details"
+                  ? "正在解析通过筛选的商品与 SKU"
+                  : busy === "facts"
+                    ? "正在采集店铺资质并筛选 Offer"
+                    : "正在搜索 1688 货源"}
+              </b>
+              <span>
+                {captureProgress.completed} / {captureProgress.total || "—"}
+              </span>
+            </div>
+            <progress
+              value={captureProgress.completed}
+              max={Math.max(1, captureProgress.total)}
+            />
+            <small>
+              成功 {captureProgress.succeeded}　失败 {captureProgress.failed}
+            </small>
+          </div>
+        )}
+
+        {(error || (!busy && progress)) && (
+          <div className={`status-box${error ? " error" : ""}`}>
+            {error || progress}
+          </div>
+        )}
+      </section>
+
+      {stats && (
+        <section className="sourcing-kpis" aria-label="选品任务数据统计">
+          <div>
+            <b>{stats.fetched}</b>
+            <span>搜索结果</span>
+          </div>
+          <div>
+            <b>{stats.unique}</b>
+            <span>有效 1688 货源</span>
+          </div>
+          <div>
+            <b>{stats.sourceProducts}</b>
+            <span>解析商品</span>
+          </div>
+          <div>
+            <b>{stats.sourceSkus}</b>
+            <span>采购规格</span>
+          </div>
+        </section>
+      )}
+
+      {items.length > 0 && (
+        <section className="card raw-results offer-pool-workbench">
+          <div className="offer-admission-summary">
+            <div>
+              <b>{admission.captured}</b>
+              <span>已采集 Offer</span>
+            </div>
+            <div>
+              <b className="pass-text">{admission.pass}</b>
+              <span>通过筛选</span>
+            </div>
+            <div>
+              <b className="risk-text">{admission.risk + admission.pending}</b>
+              <span>待确认</span>
+            </div>
+            <div>
+              <b className="reject-text">{admission.reject}</b>
+              <span>淘汰 Offer</span>
+            </div>
+            <div>
+              <b>
+                {admission.captured
+                  ? Math.round((admission.pass / admission.captured) * 100)
+                  : 0}
+                %
+              </b>
+              <span>筛选通过率</span>
+            </div>
+          </div>
+
+          <div className="offer-filter-panel">
+            <b>筛选条件</b>
+            {[
+              ["onePiece", "一件代发"],
+              ["blind", "无痕发货"],
+              ["returns", "退货保障"],
+              ["stock", "库存 > 100"],
+              ["shopAge", "店铺经营 > 1 年"],
+            ].map(([key, label]) => (
+              <label key={key}>
+                <input
+                  type="checkbox"
+                  checked={requirements[key as keyof typeof requirements]}
+                  onChange={(e) =>
+                    setRequirements((old) => ({
+                      ...old,
+                      [key]: e.target.checked,
+                    }))
+                  }
+                />
+                {label}
+              </label>
+            ))}
+            <button
+              className="secondary-btn"
+              onClick={() =>
+                setRequirements({
+                  onePiece: false,
+                  blind: false,
+                  returns: false,
+                  stock: false,
+                  shopAge: false,
+                })
+              }
+            >
+              重置
+            </button>
+          </div>
+
+          <div className="raw-toolbar">
+            <div className="offer-status-tabs">
+              {(["ALL", "PASS", "RISK", "REJECT"] as const).map((status) => (
+                <button
+                  key={status}
+                  className={filter === status ? "active" : ""}
+                  onClick={() => setFilter(status)}
+                >
+                  {
+                    {
+                      ALL: "全部",
+                      PASS: "推荐",
+                      RISK: "待确认",
+                      REJECT: "淘汰",
+                    }[status]
+                  }
+                </button>
+              ))}
+            </div>
+            <select
+              className="input"
+              value={sort}
+              onChange={(e) => setSort(e.target.value)}
+            >
+              <option value="score">综合排序</option>
+              <option value="sales">Offer 级销量</option>
+              <option value="price">采购价</option>
+            </select>
+          </div>
+          <div className="table-wrap">
+            <table className="table offer-admission-table">
+              <thead>
+                <tr>
+                  <th>1688 Offer</th>
+                  <th>采购价</th>
+                  <th>供应能力</th>
+                  <th>店铺质量</th>
+                  <th>商品表现</th>
+                  <th>准入状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sortedAudit.map((x) => (
+                  <tr key={x.id}>
+                    <td>
+                      <a href={x.source_url} target="_blank" rel="noreferrer">
+                        {x.title}
+                      </a>
+                      <small className="mapping-arrow">
+                        {x.supplier_name ?? "供应商待核实"}
+                      </small>
+                    </td>
+                    <td>
+                      {x.price_min == null ? "待核实" : `¥${x.price_min} 起`}
+                    </td>
+                    <td>
+                      <small>
+                        一件代发{" "}
+                        {x.one_piece_delivery == null
+                          ? "待采集"
+                          : x.one_piece_delivery
+                            ? "✓"
+                            : "✕"}
+                        <br />
+                        无痕发货{" "}
+                        {x.blind_shipping == null
+                          ? "待采集"
+                          : x.blind_shipping
+                            ? "✓"
+                            : "✕"}
+                        <br />
+                        退货保障{" "}
+                        {(x.return_shipping ?? x.no_reason_return) == null
+                          ? "待采集"
+                          : x.return_shipping || x.no_reason_return
+                            ? "✓"
+                            : "✕"}
+                      </small>
+                    </td>
+                    <td>
+                      <small>
+                        经营{" "}
+                        {x.shop_age == null ? "待采集" : `${x.shop_age} 年`}
+                        <br />
+                        品质{" "}
+                        {x.quality_rate == null
+                          ? "待采集"
+                          : `${x.quality_rate}%`}
+                        <br />
+                        回头率{" "}
+                        {x.repurchase_rate == null
+                          ? "待采集"
+                          : `${x.repurchase_rate}%`}
+                      </small>
+                    </td>
+                    <td>
+                      <small>
+                        销量 {x.sales_count ?? "待核实"}
+                        <br />
+                        库存 {x.stock ?? "待采集"}
+                        <br />
+                        视频{" "}
+                        {x.has_video == null
+                          ? "待采集"
+                          : x.has_video
+                            ? "✓"
+                            : "✕"}
+                      </small>
+                    </td>
+                    <td>
+                      {!x.offer_facts_captured_at ? (
+                        <span className="data-state needs_review">
+                          待采集详情
+                        </span>
+                      ) : (
+                        <>
+                          <span
+                            className={`data-state ${x.offer_status?.toLowerCase()}`}
+                          >
+                            {
+                              { PASS: "推荐", RISK: "待确认", REJECT: "淘汰" }[
+                                x.offer_status ?? "RISK"
+                              ]
+                            }
+                          </span>
+                          <small className="mapping-arrow">
+                            {x.offer_reasons?.join("、") || "事实完整"}
+                          </small>
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+                {!sortedAudit.length && (
+                  <tr>
+                    <td colSpan={6}>当前筛选条件下没有货源</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+    </>
+  );
+}
+
+function TopSummaryCard({
+  direction,
+  rank,
+}: {
+  direction: ProductDirection;
+  rank: number;
+}) {
+  const reviewed = isReviewDone(direction);
+  const product =
+    direction.products.find(
+      (item) => item.id === direction.representativeProductId,
+    ) ?? direction.products[0];
+  const bestSku = product?.skus.find((sku) => isTrustedPrice(sku)) ?? null;
+
+  return (
+    <article className="card direction-card">
+      <div className="direction-card-head">
+        <div>
+          <span className="eyebrow">
+            Top {rank} · {labelRecommendation(direction.recommendation)} · AI
+            方向价值
+          </span>
+          <h2>{direction.name}</h2>
+          <p className="muted">
+            {direction.productCount} 个货源 · {direction.skuCount} 个规格
+          </p>
+        </div>
+        <div className="direction-score">
+          <b>
+            {reviewed
+              ? (direction.directionScore ?? direction.aiScore ?? "—")
+              : "待复核"}
+          </b>
+          <span>Direction Score</span>
+        </div>
+      </div>
+      <p className="muted">
+        {reviewed
+          ? (direction.summary ?? direction.marketReason ?? "方向信息待补充")
+          : "DeepSeek 复核中"}
+      </p>
+      {product && bestSku ? (
+        <div className="offer-role">
+          <b>当前建议</b>
+          <span>{product.normalizedName}</span>
+          <span>{product.supplier_name ?? "待核实"}</span>
+          <span>
+            {formatMoney(bestSku.dropshipPrice ?? bestSku.wholesalePrice)}
+          </span>
+        </div>
+      ) : (
+        <div className="offer-role">
+          <b>当前建议</b>
+          <span>{product?.normalizedName ?? "待核实"}</span>
+          <span>待核实</span>
+          <span>—</span>
+        </div>
+      )}
+      <div className="direction-summary-mini">
+        <small>
+          核心价值：
+          {reviewed
+            ? (direction.commercialReadiness ?? 0) + " / 100"
+            : "待复核"}
+        </small>
+      </div>
+    </article>
+  );
+}
+
+function DirectionCard({
+  direction,
+  runId,
+  isStale,
+}: {
+  direction: ProductDirection;
+  runId: string;
+  isStale: boolean;
+}) {
+  const reviewed = isReviewDone(direction);
+  const { totalSku, trustedSku, verifiedOffer } = directionCoverage(direction);
+  const priceText = directionPriceRange(direction);
+
+  return (
+    <article className="card direction-card">
+      <div className="direction-card-head">
+        <div>
+          <span className="eyebrow">
+            {labelRecommendation(direction.recommendation)}
+          </span>
+          <h2>{direction.name}</h2>
+          <p className="muted">
+            {direction.productCount} 个候选货源 · {direction.skuCount}{" "}
+            个可采购规格
+          </p>
+        </div>
+        <div className="direction-score">
+          <b>
+            {reviewed
+              ? (direction.directionScore ?? direction.aiScore ?? "—")
+              : "待复核"}
+          </b>
+          <span>方向价值分</span>
+        </div>
+      </div>
+
+      <div className="direction-summary">
+        <div>
+          <span>已确认一件代发</span>
+          <b>
+            {verifiedOffer} / {direction.productCount}
+          </b>
+        </div>
+        <div>
+          <span>可信价格覆盖</span>
+          <b>
+            {trustedSku} / {totalSku}
+          </b>
+        </div>
+        <div>
+          <span>价格区间</span>
+          <b>{priceText}</b>
+        </div>
+        <div>
+          <span>AI方向价值</span>
+          <b>{isStale ? "待重跑" : reviewed ? "已复核" : "待复核"}</b>
+        </div>
+      </div>
+
+      <p className="direction-ai">
+        <b>说明：</b>
+        {reviewed
+          ? `${direction.summary ?? direction.marketReason ?? "AI 方向建议已形成"}${direction.nextAction ? `；建议动作：${direction.nextAction}` : ""}`
+          : "该方向尚未完成 AI 复核，建议先运行阶段 3"}
+      </p>
+
+      <div className="action-buttons">
+        <span className="review-state">
+          任务状态：{reviewed ? "已进入阶段3" : "待复核"}
+        </span>
+        <Link
+          className="btn"
+          href={
+            runId
+              ? `/products/discover/runs/${runId}/directions/${direction.id}`
+              : "/products/discover"
+          }
+          style={{ textDecoration: "none" }}
+        >
+          查看货源
+        </Link>
+      </div>
+    </article>
+  );
 }

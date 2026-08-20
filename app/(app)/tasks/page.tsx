@@ -1,2 +1,1 @@
-import{TaskList}from"@/components/tasks/task-list";
-export default function Page(){return <><header className="top"><div><h1>任务</h1><p className="muted">将 AI 建议变成可执行、可追踪的经营动作</p></div></header><TaskList/></>}
+import{UnifiedTasks}from"@/components/store/domain-views";export default function Page(){return <><header className="top"><div><h1>今日待办</h1><p className="muted">订单和 AI Action 驱动的实时任务</p></div></header><UnifiedTasks/></>}

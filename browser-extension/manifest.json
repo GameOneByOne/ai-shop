@@ -1,10 +1,13 @@
 {
   "manifest_version": 3,
   "name": "AI 店长 1688 采集桥",
-  "version": "0.2.5",
-  "description": "将当前已登录的 1688 搜索结果低频导入本地 AI 店长。",
+  "version": "0.7.0",
+  "description": "将已登录的 1688 Offer 解析为 SourceProduct 与 SourceSku 后导入本地 AI 店长。",
   "permissions": ["tabs", "scripting"],
   "host_permissions": [
+    "https://s.1688.com/*",
+    "https://detail.1688.com/*",
+    "https://sale.1688.com/*",
     "https://*.1688.com/*",
     "https://1688.com/*",
     "https://*.alibaba.com/*",
@@ -17,6 +20,11 @@
       "matches": ["http://localhost:3000/*"],
       "js": ["bridge.js"],
       "run_at": "document_start"
+    },
+    {
+      "matches": ["https://s.1688.com/*", "https://detail.1688.com/*"],
+      "js": ["page-scraper.js"],
+      "run_at": "document_idle"
     }
   ]
 }

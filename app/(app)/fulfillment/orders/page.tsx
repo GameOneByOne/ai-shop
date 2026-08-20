@@ -1,0 +1,1 @@
+import{Orders}from"@/components/fulfillment/orders";export default function Page(){return <><header className="top"><div><div className="eyebrow">DEMO DATA</div><h1>淘宝订单</h1><p className="muted">统一 Store State 中的订单与履约状态</p></div></header><Orders/></>}
