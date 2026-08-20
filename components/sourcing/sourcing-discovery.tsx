@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import type {
   DirectionRecommendation,
   DirectionSourceProduct,
@@ -154,6 +155,7 @@ function stageSummary(pipeline: Pipeline | null) {
 }
 
 export function SourcingDiscovery() {
+  const router = useRouter();
   const [query, setQuery] = useState("猫隧道");
   const [keywordText, setKeywordText] = useState(
     "猫隧道\n猫咪隧道\n宠物隧道\n可折叠猫隧道\n猫玩具隧道",
@@ -172,6 +174,7 @@ export function SourcingDiscovery() {
     failed: number;
   } | null>(null);
   const [error, setError] = useState("");
+  const [clustering, setClustering] = useState(false);
   const [filter, setFilter] = useState("ALL");
   const [sort, setSort] = useState("score");
   const [requirements, setRequirements] = useState({
@@ -486,6 +489,25 @@ export function SourcingDiscovery() {
     );
   }
 
+  async function clusterProductModels() {
+    setClustering(true);
+    setError("");
+    setProgress("正在聚类 SourceSKU 并生成商品款型池…");
+    try {
+      const response = await fetch("/api/sourcing/v3/analyze", {
+        method: "POST",
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error ?? "商品款型聚类失败");
+      router.push("/products/discover");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "商品款型聚类失败");
+      setProgress("");
+    } finally {
+      setClustering(false);
+    }
+  }
+
   const allPrimary = useMemo(
     () => directions.filter((x) => x.taskRelevance === "PRIMARY"),
     [directions],
@@ -581,6 +603,18 @@ export function SourcingDiscovery() {
             {busy === "details"
               ? `正在解析 ${captureProgress?.completed ?? 0}/${captureProgress?.total ?? 0}`
               : "2. 解析通过筛选的商品与 SKU"}
+          </button>
+          <button
+            className="secondary-btn"
+            disabled={
+              Boolean(busy) ||
+              clustering ||
+              pipeline?.stage2Status !== "COMPLETED" ||
+              !stats?.sourceSkus
+            }
+            onClick={() => void clusterProductModels()}
+          >
+            {clustering ? "正在聚类商品款型…" : "3. AI 聚类商品款型池"}
           </button>
         </div>
 

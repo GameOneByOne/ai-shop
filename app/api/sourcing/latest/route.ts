@@ -164,7 +164,13 @@ export async function GET() {
     history = Array.isArray(criteria.directionReviewHistory)
       ? criteria.directionReviewHistory
       : [];
-  const v3 = buildSourcingV3(qualifiedRows, String(run.query ?? ""));
+  const savedV3 = criteria.sourcingV3 as Record<string, unknown> | undefined;
+  const v3 =
+    savedV3 &&
+    Number(savedV3.stage2Version ?? -1) === currentStage2Version &&
+    savedV3.graph
+      ? (savedV3.graph as ReturnType<typeof buildSourcingV3>)
+      : buildSourcingV3(qualifiedRows, String(run.query ?? ""));
   return Response.json({
     runId: run.id,
     sourcingRunId: run.id,
@@ -172,6 +178,15 @@ export async function GET() {
     keywords,
     products: rows,
     v3,
+    v3Meta: savedV3
+      ? {
+          execution: savedV3.execution,
+          requestedModel: savedV3.requestedModel,
+          actualModel: savedV3.actualModel,
+          fallbackReason: savedV3.fallbackReason,
+          analyzedAt: savedV3.analyzedAt,
+        }
+      : null,
     directions,
     primaryDirections: primary,
     adjacentDirections: adjacent,

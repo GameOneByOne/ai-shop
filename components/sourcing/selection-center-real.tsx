@@ -37,6 +37,13 @@ type Payload = {
   stats?: { fetched?: number };
   products?: Offer[];
   v3?: SourcingV3Graph;
+  v3Meta?: {
+    execution?: "DEEPSEEK" | "RULE_FALLBACK";
+    requestedModel?: string;
+    actualModel?: string;
+    fallbackReason?: string | null;
+    analyzedAt?: string;
+  } | null;
 };
 const Icon = ({
   children,
@@ -99,10 +106,7 @@ export function RealDiscoveryWorkspace() {
       [graph, query],
     ),
     model = models[selected] ?? models[0],
-    allSourceSkus = useMemo(
-      () => graph?.sourceSkus ?? [],
-      [graph],
-    ),
+    allSourceSkus = useMemo(() => graph?.sourceSkus ?? [], [graph]),
     pending = useMemo(
       () => allSourceSkus.filter((x) => x.price == null || x.stock == null),
       [allSourceSkus],
@@ -171,11 +175,16 @@ export function RealDiscoveryWorkspace() {
       const save = await fetch("/api/sourcing/enrich", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ runId: data.runId, details: result.details ?? [] }),
+        body: JSON.stringify({
+          runId: data.runId,
+          details: result.details ?? [],
+        }),
       });
       const saved = await save.json();
       if (!save.ok) throw new Error(saved.error ?? "保存重查结果失败");
-      const analyze = await fetch("/api/sourcing/v3/analyze", { method: "POST" });
+      const analyze = await fetch("/api/sourcing/v3/analyze", {
+        method: "POST",
+      });
       const analyzed = await analyze.json();
       if (!analyze.ok) throw new Error(analyzed.error ?? "刷新分析结果失败");
       setData((current) =>
@@ -307,6 +316,15 @@ export function RealDiscoveryWorkspace() {
           </div>
         </div>
       )}
+      {data?.v3Meta && (
+        <div
+          className={`status-box ${data.v3Meta.execution === "DEEPSEEK" ? "success" : "reading"}`}
+        >
+          {data.v3Meta.execution === "DEEPSEEK"
+            ? `商品款型池由真实 AI 聚类：${data.v3Meta.actualModel ?? data.v3Meta.requestedModel}`
+            : `AI 调用失败，已使用规则引擎兜底：${data.v3Meta.fallbackReason ?? "未知原因"}`}
+        </div>
+      )}
       <div className="v2-tabs">
         <button
           className={tab === "models" ? "active" : ""}
@@ -364,13 +382,17 @@ export function RealDiscoveryWorkspace() {
           <div className="v2-toolbar">
             <div className="v2-filter-group">
               <button
-                className={sourceFilter === "all" ? "v2-primary" : "v2-secondary"}
+                className={
+                  sourceFilter === "all" ? "v2-primary" : "v2-secondary"
+                }
                 onClick={() => setSourceFilter("all")}
               >
                 全部货源 ({allSourceSkus.length})
               </button>
               <button
-                className={sourceFilter === "pending" ? "v2-primary" : "v2-secondary"}
+                className={
+                  sourceFilter === "pending" ? "v2-primary" : "v2-secondary"
+                }
                 onClick={() => setSourceFilter("pending")}
               >
                 待核实 ({pending.length})
@@ -768,7 +790,8 @@ function OfferTable({ offers }: { offers: Offer[] }) {
     });
   const rows = offers.filter((offer) => {
       if (status !== "ALL" && offer.offer_status !== status) return false;
-      if (requirements.delivery && offer.one_piece_delivery !== true) return false;
+      if (requirements.delivery && offer.one_piece_delivery !== true)
+        return false;
       if (requirements.blind && offer.blind_shipping !== true) return false;
       if (
         requirements.returns &&
@@ -790,101 +813,173 @@ function OfferTable({ offers }: { offers: Offer[] }) {
   return (
     <>
       <div className="offer-admission-summary">
-        <div><b>{offers.length}</b><span>采集 Offer</span></div>
-        <div><b className="success">{counts.PASS}</b><span>通过筛选</span></div>
-        <div><b className="orange">{counts.RISK}</b><span>待确认</span></div>
-        <div><b className="danger">{counts.REJECT}</b><span>淘汰 Offer</span></div>
+        <div>
+          <b>{offers.length}</b>
+          <span>采集 Offer</span>
+        </div>
+        <div>
+          <b className="success">{counts.PASS}</b>
+          <span>通过筛选</span>
+        </div>
+        <div>
+          <b className="orange">{counts.RISK}</b>
+          <span>待确认</span>
+        </div>
+        <div>
+          <b className="danger">{counts.REJECT}</b>
+          <span>淘汰 Offer</span>
+        </div>
       </div>
       <div className="offer-filter-panel">
         <b>货源筛选</b>
-        {([
-          ["delivery", "一件代发"],
-          ["blind", "无痕发货"],
-          ["returns", "退货保障"],
-          ["stock", "库存 > 100"],
-          ["age", "店铺经营 > 1 年"],
-        ] as const).map(([key, label]) => (
+        {(
+          [
+            ["delivery", "一件代发"],
+            ["blind", "无痕发货"],
+            ["returns", "退货保障"],
+            ["stock", "库存 > 100"],
+            ["age", "店铺经营 > 1 年"],
+          ] as const
+        ).map(([key, label]) => (
           <label key={key}>
-            <input type="checkbox" checked={requirements[key]} onChange={() => toggle(key)} />
+            <input
+              type="checkbox"
+              checked={requirements[key]}
+              onChange={() => toggle(key)}
+            />
             {label}
           </label>
         ))}
-        <button className="v2-secondary" onClick={() => setRequirements({ delivery:false,blind:false,returns:false,stock:false,age:false })}>重置</button>
+        <button
+          className="v2-secondary"
+          onClick={() =>
+            setRequirements({
+              delivery: false,
+              blind: false,
+              returns: false,
+              stock: false,
+              age: false,
+            })
+          }
+        >
+          重置
+        </button>
       </div>
       <div className="v2-filter-group offer-status-tabs">
         {(["ALL", "PASS", "RISK", "REJECT"] as const).map((value) => (
-          <button key={value} className={status === value ? "v2-primary" : "v2-secondary"} onClick={() => setStatus(value)}>
-            {value === "ALL" ? `全部 (${offers.length})` : value === "PASS" ? `推荐 (${counts.PASS})` : value === "RISK" ? `待确认 (${counts.RISK})` : `淘汰 (${counts.REJECT})`}
+          <button
+            key={value}
+            className={status === value ? "v2-primary" : "v2-secondary"}
+            onClick={() => setStatus(value)}
+          >
+            {value === "ALL"
+              ? `全部 (${offers.length})`
+              : value === "PASS"
+                ? `推荐 (${counts.PASS})`
+                : value === "RISK"
+                  ? `待确认 (${counts.RISK})`
+                  : `淘汰 (${counts.REJECT})`}
           </button>
         ))}
       </div>
       <table className="v2-table offer-admission-table">
-      <thead>
-        <tr>
-          <th>商品标题</th>
-          <th>供应商</th>
-          <th>采购价</th>
-          <th>供应能力</th>
-          <th>店铺质量</th>
-          <th>商品表现</th>
-          <th>状态</th>
-          <th>操作</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows.map((o) => {
-          const hasDetail = Boolean(o.raw_data.detailEnrichment),
-            d = (o.raw_data.detailEnrichment ?? {}) as Record<string, unknown>,
-            count = Array.isArray(d.rawOptions) ? d.rawOptions.length : 0;
-          return (
-            <tr key={o.id}>
-              <td>
-                <b>{o.title}</b>
-              </td>
-              <td>
-                {o.supplier_name ? cleanSupplier(o.supplier_name) : "待确认"}
-              </td>
-              <td>
-                <b>{money(o.price_min)}</b>
-                <small>MOQ {o.minimum_order_quantity ?? "待确认"}</small>
-              </td>
-              <td>
-                <small>{fact(o.one_piece_delivery, "一件代发")}</small>
-                <small>{fact(o.blind_shipping, "无痕发货")}</small>
-                <small>{fact(o.return_shipping === true || o.no_reason_return === true ? true : o.return_shipping === false && o.no_reason_return === false ? false : null, "退货保障")}</small>
-              </td>
-              <td>
-                <small>经营 {o.shop_age == null ? "待确认" : `${o.shop_age} 年`}</small>
-                <small>品质 {percent(o.quality_rate)}</small>
-                <small>回头率 {percent(o.repurchase_rate)}</small>
-                <small>揽收率 {percent(o.delivery_rate)}</small>
-              </td>
-              <td>
-                <small>库存 {o.stock ?? "待确认"}</small>
-                <small>近30天销量 {o.sales_count ?? "待确认"}</small>
-                <small>主图 {o.image_count ?? "待确认"} 张 · 视频 {o.has_video ? "有" : "无/待确认"}</small>
-              </td>
-              <td>
-                <span className={`v2-pill ${o.offer_status === "PASS" ? "success" : o.offer_status === "REJECT" ? "danger" : "orange"}`}>
-                  {o.offer_status === "PASS" ? "🟢 推荐" : o.offer_status === "REJECT" ? "🔴 淘汰" : "🟡 待确认"}
-                </span>
-                <small>{o.offer_reasons?.join("；") || (hasDetail ? `${count} 个 SKU 已解析` : "等待详情事实采集")}</small>
-              </td>
-              <td>
-                <a href={o.source_url} target="_blank" rel="noreferrer">
-                  打开1688 ↗
-                </a>
-              </td>
-            </tr>
-          );
-        })}
-      </tbody>
+        <thead>
+          <tr>
+            <th>商品标题</th>
+            <th>供应商</th>
+            <th>采购价</th>
+            <th>供应能力</th>
+            <th>店铺质量</th>
+            <th>商品表现</th>
+            <th>状态</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((o) => {
+            const hasDetail = Boolean(o.raw_data.detailEnrichment),
+              d = (o.raw_data.detailEnrichment ?? {}) as Record<
+                string,
+                unknown
+              >,
+              count = Array.isArray(d.rawOptions) ? d.rawOptions.length : 0;
+            return (
+              <tr key={o.id}>
+                <td>
+                  <b>{o.title}</b>
+                </td>
+                <td>
+                  {o.supplier_name ? cleanSupplier(o.supplier_name) : "待确认"}
+                </td>
+                <td>
+                  <b>{money(o.price_min)}</b>
+                  <small>MOQ {o.minimum_order_quantity ?? "待确认"}</small>
+                </td>
+                <td>
+                  <small>{fact(o.one_piece_delivery, "一件代发")}</small>
+                  <small>{fact(o.blind_shipping, "无痕发货")}</small>
+                  <small>
+                    {fact(
+                      o.return_shipping === true || o.no_reason_return === true
+                        ? true
+                        : o.return_shipping === false &&
+                            o.no_reason_return === false
+                          ? false
+                          : null,
+                      "退货保障",
+                    )}
+                  </small>
+                </td>
+                <td>
+                  <small>
+                    经营 {o.shop_age == null ? "待确认" : `${o.shop_age} 年`}
+                  </small>
+                  <small>品质 {percent(o.quality_rate)}</small>
+                  <small>回头率 {percent(o.repurchase_rate)}</small>
+                  <small>揽收率 {percent(o.delivery_rate)}</small>
+                </td>
+                <td>
+                  <small>库存 {o.stock ?? "待确认"}</small>
+                  <small>近30天销量 {o.sales_count ?? "待确认"}</small>
+                  <small>
+                    主图 {o.image_count ?? "待确认"} 张 · 视频{" "}
+                    {o.has_video ? "有" : "无/待确认"}
+                  </small>
+                </td>
+                <td>
+                  <span
+                    className={`v2-pill ${o.offer_status === "PASS" ? "success" : o.offer_status === "REJECT" ? "danger" : "orange"}`}
+                  >
+                    {o.offer_status === "PASS"
+                      ? "🟢 推荐"
+                      : o.offer_status === "REJECT"
+                        ? "🔴 淘汰"
+                        : "🟡 待确认"}
+                  </span>
+                  <small>
+                    {o.offer_reasons?.join("；") ||
+                      (hasDetail
+                        ? `${count} 个 SKU 已解析`
+                        : "等待详情事实采集")}
+                  </small>
+                </td>
+                <td>
+                  <a href={o.source_url} target="_blank" rel="noreferrer">
+                    打开1688 ↗
+                  </a>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
       </table>
     </>
   );
 }
-const fact = (value: boolean | null, label: string) => value === true ? `✓ ${label}` : value === false ? `✕ ${label}` : `? ${label}`;
-const percent = (value: number | null) => value == null ? "待确认" : `${value}%`;
+const fact = (value: boolean | null, label: string) =>
+  value === true ? `✓ ${label}` : value === false ? `✕ ${label}` : `? ${label}`;
+const percent = (value: number | null) =>
+  value == null ? "待确认" : `${value}%`;
 const money = (v: number | null) =>
   v == null ? "待核实" : `¥${Number(v).toFixed(2)}`;
 const inventory = (v: number | null) =>
