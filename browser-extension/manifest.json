@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI 店长 1688 采集桥",
-  "version": "0.7.0",
+  "version": "0.7.2",
   "description": "将已登录的 1688 Offer 解析为 SourceProduct 与 SourceSku 后导入本地 AI 店长。",
   "permissions": ["tabs", "scripting"],
   "host_permissions": [

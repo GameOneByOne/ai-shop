@@ -1,6 +1,7 @@
 "use client";
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
+import { SourcingDiscovery } from "@/components/sourcing/sourcing-discovery";
 import type {
   SourcingV3Graph,
   V3ProductModel,
@@ -38,7 +39,7 @@ type Payload = {
   products?: Offer[];
   v3?: SourcingV3Graph;
   v3Meta?: {
-    execution?: "DEEPSEEK" | "RULE_FALLBACK";
+    execution?: "MULTIMODAL" | "DEEPSEEK" | "RULE_FALLBACK";
     requestedModel?: string;
     actualModel?: string;
     fallbackReason?: string | null;
@@ -82,50 +83,117 @@ const cleanSupplier = (value: string) =>
       "",
     )
     .trim();
-export function RealDiscoveryWorkspace() {
+const DEFAULT_PHASH_MERGE_THRESHOLD = 30;
+
+function phashDistance(left: string, right: string) {
+  let bits = BigInt(`0x${left}`) ^ BigInt(`0x${right}`);
+  let distance = 0;
+  while (bits) {
+    distance += Number(bits & BigInt(1));
+    bits >>= BigInt(1);
+  }
+  return distance;
+}
+
+function mergeSourceSkuColors(
+  rows: V3SourceSku[],
+  hashes: Record<string, string>,
+  threshold = DEFAULT_PHASH_MERGE_THRESHOLD,
+) {
+  const groups = new Map<string, V3SourceSku[]>();
+  const singles: V3SourceSku[] = [];
+  for (const row of rows) {
+    if (row.price == null || !hashes[row.id]) {
+      singles.push(row);
+      continue;
+    }
+    const key = [row.offerId, row.supplierName, row.price].join("|");
+    groups.set(key, [...(groups.get(key) ?? []), row]);
+  }
+  const imageClusters = [...groups.values()].flatMap((group) => {
+    const clusters: V3SourceSku[][] = [];
+    for (const row of group) {
+      const target = clusters.find((cluster) =>
+        cluster.some(
+          (candidate) =>
+            phashDistance(hashes[row.id], hashes[candidate.id]) < threshold,
+        ),
+      );
+      if (target) target.push(row);
+      else clusters.push([row]);
+    }
+    return clusters;
+  });
+  const merged = imageClusters.flatMap((group) => {
+    if (group.length < 2) return group;
+    const representative = group.find((row) => row.image) ?? group[0];
+    return [
+      {
+        ...representative,
+        id: `merged-colors:${group.map((row) => row.id).join("|")}`,
+        rawName: group.map((row) => row.rawName).join(" / "),
+        stock: group.every((row) => row.stock != null)
+          ? group.reduce((total, row) => total + (row.stock ?? 0), 0)
+          : null,
+        rawProperties: {
+          ...representative.rawProperties,
+          mergedSourceSkuIds: group.map((row) => row.id),
+          mergedSourceSkus: group.map((row) => ({
+            id: row.id,
+            rawName: row.rawName,
+            image: row.image,
+            price: row.price,
+            stock: row.stock,
+            hash: hashes[row.id],
+            phashDistance: Math.min(
+              ...group
+                .filter((candidate) => candidate.id !== row.id)
+                .map((candidate) =>
+                  phashDistance(hashes[row.id], hashes[candidate.id]),
+                ),
+            ),
+          })),
+        },
+      },
+    ];
+  });
+  return [...merged, ...singles];
+}
+export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
   const [data, setData] = useState<Payload | null>(null),
     [tab, setTab] = useState<"models" | "pending" | "offers">("models"),
     [query, setQuery] = useState(""),
     [selected, setSelected] = useState(0),
     [sourceFilter, setSourceFilter] = useState<"all" | "pending">("all"),
-    [busy, setBusy] = useState(false),
+    [mergeColors, setMergeColors] = useState(false),
+    [mergingColors, setMergingColors] = useState(false),
+    [phashThreshold, setPhashThreshold] = useState(
+      DEFAULT_PHASH_MERGE_THRESHOLD,
+    ),
+    [imageHashes, setImageHashes] = useState<Record<string, string>>({}),
     [rechecking, setRechecking] = useState(false),
     [message, setMessage] = useState("");
-  useEffect(() => {
-    void fetch("/api/sourcing/latest")
+  const refreshData = useCallback(async () => {
+    const url = runId
+      ? `/api/sourcing/latest?runId=${encodeURIComponent(runId)}`
+      : "/api/sourcing/latest";
+    await fetch(url)
       .then(async (r) => {
         const body = await r.json();
         if (!r.ok) throw new Error(body.error ?? "读取失败");
         setData(body);
       })
       .catch((e) => setMessage(e instanceof Error ? e.message : "读取失败"));
-  }, []);
+  }, [runId]);
+  useEffect(() => {
+    void refreshData();
+  }, [refreshData]);
   const graph = data?.v3,
-    models = useMemo(
-      () => (graph?.models ?? []).filter((x) => x.name.includes(query)),
-      [graph, query],
-    ),
+    models = (graph?.models ?? []).filter((x) => x.name.includes(query)),
     model = models[selected] ?? models[0],
-    allSourceSkus = useMemo(() => graph?.sourceSkus ?? [], [graph]),
-    pending = useMemo(
-      () => allSourceSkus.filter((x) => x.price == null || x.stock == null),
-      [allSourceSkus],
-    ),
+    allSourceSkus = graph?.sourceSkus ?? [],
+    pending = allSourceSkus.filter((x) => x.price == null || x.stock == null),
     visibleSourceSkus = sourceFilter === "pending" ? pending : allSourceSkus;
-  async function rerun() {
-    setBusy(true);
-    setMessage("");
-    try {
-      const r = await fetch("/api/sourcing/v3/analyze", { method: "POST" }),
-        body = await r.json();
-      if (!r.ok) throw new Error(body.error ?? "重新分析失败");
-      setData((x) => (x ? { ...x, v3: body.graph } : x));
-    } catch (e) {
-      setMessage(e instanceof Error ? e.message : "重新分析失败");
-    } finally {
-      setBusy(false);
-    }
-  }
   async function recheckPending() {
     if (!data?.runId || !pending.length || rechecking) return;
     const offers = [
@@ -184,6 +252,8 @@ export function RealDiscoveryWorkspace() {
       if (!save.ok) throw new Error(saved.error ?? "保存重查结果失败");
       const analyze = await fetch("/api/sourcing/v3/analyze", {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runId: data.runId }),
       });
       const analyzed = await analyze.json();
       if (!analyze.ok) throw new Error(analyzed.error ?? "刷新分析结果失败");
@@ -202,6 +272,42 @@ export function RealDiscoveryWorkspace() {
       setRechecking(false);
     }
   }
+  async function toggleColorMerge() {
+    if (mergeColors) {
+      setMergeColors(false);
+      return;
+    }
+    const images = allSourceSkus
+      .filter((sku) => sku.image)
+      .map((sku) => ({ id: sku.id, url: sku.image! }));
+    if (!images.length) {
+      setMessage("当前采购 SKU 没有可用于颜色归并的图片。");
+      return;
+    }
+    setMergingColors(true);
+    setMessage("");
+    try {
+      const response = await fetch("/api/sourcing/image-phash", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ images }),
+      });
+      const body = (await response.json()) as {
+        hashes?: Record<string, string>;
+        failures?: string[];
+        error?: string;
+      };
+      if (!response.ok) throw new Error(body.error ?? "图片相似度计算失败");
+      setImageHashes(body.hashes ?? {});
+      setMergeColors(true);
+      if (body.failures?.length)
+        setMessage(`${body.failures.length} 张图片无法计算 pHash，已保持原始行。`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "图片相似度计算失败");
+    } finally {
+      setMergingColors(false);
+    }
+  }
   const counts = graph?.counts ?? {
       offers: 0,
       sourceSkus: 0,
@@ -211,7 +317,11 @@ export function RealDiscoveryWorkspace() {
       accessories: 0,
       unknownDimensions: 0,
     },
-    status = pending.length ? "🟡 货源待确认" : "🟢 可进入采购比较";
+    status = !data?.runId
+      ? "⚪ 未运行"
+      : pending.length
+        ? "🟡 货源待确认"
+        : "🟢 可进入采购比较";
   return (
     <div className="v2-page discovery">
       <div className="v2-crumb">
@@ -223,18 +333,19 @@ export function RealDiscoveryWorkspace() {
           <p>按商品款型和可售子产品理解真实 1688 货源，支持采购前比较。</p>
         </div>
         <div className="v2-actions">
-          <button
+          <Link
             className="v2-secondary"
-            disabled={busy}
-            onClick={() => void rerun()}
+            href="/products/discover"
           >
-            ↻ {busy ? "分析中" : "重新分析货源"}
-          </button>
-          <Link className="v2-primary" href="#capture">
-            采集真实货源
+            返回任务总页
           </Link>
         </div>
       </header>
+      <SourcingDiscovery
+        compact
+        initialRunId={runId}
+        onDataChange={refreshData}
+      />
       <section className="v2-metrics">
         <Metric
           icon="⌕"
@@ -279,7 +390,7 @@ export function RealDiscoveryWorkspace() {
       <section className="v2-decision-banner">
         <Icon tone="orange">!</Icon>
         <div>
-          <span>商品决策状态</span>
+          <span>货源任务状态</span>
           <h2>{data?.query ?? "当前商品"}</h2>
           <b>{status}</b>
         </div>
@@ -318,10 +429,10 @@ export function RealDiscoveryWorkspace() {
       )}
       {data?.v3Meta && (
         <div
-          className={`status-box ${data.v3Meta.execution === "DEEPSEEK" ? "success" : "reading"}`}
+          className={`status-box ${["MULTIMODAL", "DEEPSEEK"].includes(data.v3Meta.execution ?? "") ? "success" : "reading"}`}
         >
-          {data.v3Meta.execution === "DEEPSEEK"
-            ? `商品款型池由真实 AI 聚类：${data.v3Meta.actualModel ?? data.v3Meta.requestedModel}`
+          {["MULTIMODAL", "DEEPSEEK"].includes(data.v3Meta.execution ?? "")
+            ? `商品款型池由多模态 AI 聚类：${data.v3Meta.actualModel ?? data.v3Meta.requestedModel}`
             : `AI 调用失败，已使用规则引擎兜底：${data.v3Meta.fallbackReason ?? "未知原因"}`}
         </div>
       )}
@@ -399,6 +510,32 @@ export function RealDiscoveryWorkspace() {
               </button>
             </div>
             <button
+              className={mergeColors ? "v2-primary" : "v2-secondary"}
+              disabled={mergingColors}
+              onClick={() => void toggleColorMerge()}
+            >
+              {mergingColors
+                ? "正在比较图片…"
+                : mergeColors
+                  ? "✓ 已合并颜色"
+                  : "合并颜色"}
+            </button>
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span>pHash 阈值</span>
+              <input
+                type="number"
+                min={0}
+                max={63}
+                value={phashThreshold}
+                onChange={(event) => {
+                  const value = Number(event.target.value);
+                  setPhashThreshold(Math.max(0, Math.min(63, value || 0)));
+                }}
+                style={{ width: 68 }}
+                aria-label="颜色合并 pHash 阈值"
+              />
+            </label>
+            <button
               className="v2-secondary"
               disabled={!pending.length || rechecking}
               onClick={() => void recheckPending()}
@@ -408,7 +545,20 @@ export function RealDiscoveryWorkspace() {
                 : `↻ 一键重查待核实 (${pending.length})`}
             </button>
           </div>
-          <PendingTable rows={visibleSourceSkus} onAction={setMessage} />
+          <PendingTable
+            rows={
+              mergeColors
+                ? mergeSourceSkuColors(
+                    visibleSourceSkus,
+                    imageHashes,
+                    phashThreshold,
+                  )
+                : visibleSourceSkus
+            }
+            offers={data?.products ?? []}
+            phashThreshold={phashThreshold}
+            onAction={setMessage}
+          />
         </section>
       )}
       {tab === "offers" && (
@@ -587,7 +737,7 @@ function ModelDrawer({
         </dl>
       </div>
       <section className="v2-drawer-section v2-decision-summary">
-        <h3>商品决策摘要</h3>
+        <h3>当前款型状态</h3>
         <dl>
           <dt>推荐状态</dt>
           <dd>
@@ -659,18 +809,27 @@ function ModelDrawer({
 }
 function PendingTable({
   rows,
+  offers,
+  phashThreshold,
   onAction,
 }: {
   rows: V3SourceSku[];
+  offers: Offer[];
+  phashThreshold: number;
   onAction: (v: string) => void;
 }) {
   const [preview, setPreview] = useState<V3SourceSku | null>(null);
+  const [expandedMerge, setExpandedMerge] = useState<string | null>(null);
+  const offerTitles = new Map(
+    offers.map((offer) => [offer.id, productNameFromTitle(offer.title)]),
+  );
   return (
     <>
       <table className="v2-table">
         <thead>
           <tr>
             <th>图片</th>
+            <th>商品名</th>
             <th>SourceSKU</th>
             <th>供应商</th>
             <th>采购价</th>
@@ -679,8 +838,32 @@ function PendingTable({
           </tr>
         </thead>
         <tbody>
-          {rows.map((x) => (
-            <tr key={x.id}>
+          {rows.map((x) => {
+            const mergedSourceSkus = Array.isArray(
+              x.rawProperties.mergedSourceSkus,
+            )
+              ? (x.rawProperties.mergedSourceSkus as Array<{
+                  id: string;
+                  rawName: string;
+                  image: string | null;
+                  price: number | null;
+                  stock: number | null;
+                  hash: string;
+                  phashDistance: number;
+                }>)
+              : [];
+            const isMerged = mergedSourceSkus.length > 1;
+            const isExpanded = expandedMerge === x.id;
+            return (
+              <Fragment key={x.id}>
+            <tr
+              onClick={
+                isMerged
+                  ? () => setExpandedMerge(isExpanded ? null : x.id)
+                  : undefined
+              }
+              style={isMerged ? { cursor: "pointer" } : undefined}
+            >
               <td>
                 {x.image ? (
                   <button
@@ -697,8 +880,20 @@ function PendingTable({
                   <span className="v2-mini-img">暂无</span>
                 )}
               </td>
+              <td className="v2-product-name-cell">
+                <b>{offerTitles.get(x.offerId) ?? "商品名待核实"}</b>
+              </td>
               <td>
                 <b>{x.rawName}</b>
+                {isMerged && (
+                  <small>
+                    {isExpanded ? "▾" : "▸"} 已合并 {mergedSourceSkus.length} 个颜色 SKU，点击
+                    {isExpanded ? "收起" : "展开核对"}
+                  </small>
+                )}
+                {formatAiSpecifications(x) && (
+                  <small>{formatAiSpecifications(x)}</small>
+                )}
                 <small>{x.externalOfferId}</small>
               </td>
               <td>{cleanSupplier(x.supplierName)}</td>
@@ -732,29 +927,75 @@ function PendingTable({
               </td>
               <td>
                 <div className="v2-row-actions">
-                  <a href={x.sourceUrl} target="_blank" rel="noreferrer">
+                  <a
+                    href={x.sourceUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    onClick={(event) => event.stopPropagation()}
+                  >
                     跳转 1688 ↗
                   </a>
                   <button
-                    onClick={() =>
+                    onClick={(event) => {
+                      event.stopPropagation();
                       onAction(`已将「${x.rawName}」加入人工确认队列。`)
-                    }
+                    }}
                   >
                     人工确认
                   </button>
                   <button
-                    onClick={() =>
+                    onClick={(event) => {
+                      event.stopPropagation();
                       onAction(
                         `已在当前视图忽略「${x.rawName}」；原始数据未删除。`,
                       )
-                    }
+                    }}
                   >
                     忽略
                   </button>
                 </div>
               </td>
             </tr>
-          ))}
+            {isMerged && isExpanded && (
+              <tr>
+                <td colSpan={7} style={{ background: "#f8fafc", padding: 16 }}>
+                  <table className="v2-table compact">
+                    <thead>
+                      <tr>
+                        <th>原始图片</th>
+                        <th>原始 SourceSKU</th>
+                        <th>采购价</th>
+                        <th>库存</th>
+                        <th>组内最小 pHash 距离</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {mergedSourceSkus.map((sourceSku) => (
+                        <tr key={sourceSku.id}>
+                          <td>
+                            {sourceSku.image ? (
+                              <img className="v2-mini-img" src={sourceSku.image} alt="" />
+                            ) : (
+                              "暂无"
+                            )}
+                          </td>
+                          <td><b>{sourceSku.rawName}</b></td>
+                          <td>{sourceSku.price == null ? "待核实" : money(sourceSku.price)}</td>
+                          <td>{sourceSku.stock == null ? "待核实" : inventory(sourceSku.stock)}</td>
+                          <td>
+                            {sourceSku.phashDistance}
+                              <small>当前阈值 &lt; {phashThreshold}</small>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </td>
+              </tr>
+            )}
+              </Fragment>
+            );
+          })}
         </tbody>
       </table>
       {preview?.image && (
@@ -776,6 +1017,28 @@ function PendingTable({
       )}
     </>
   );
+}
+function formatAiSpecifications(sku: V3SourceSku) {
+  const specifications = sku.rawProperties.aiSpecifications;
+  if (!Array.isArray(specifications)) return "";
+  return specifications
+    .flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const record = item as Record<string, unknown>;
+      return record.name && record.value
+        ? [
+            `${String(record.name)}：${String(record.value)}${record.basis ? `（${String(record.basis)}）` : ""}`,
+          ]
+        : [];
+    })
+    .join(" · ");
+}
+function productNameFromTitle(title: string) {
+  const normalized = title.replace(/\s+/g, " ").trim();
+  const commercialInfo =
+    /\s*(?:[|｜]\s*)?(?:[¥￥]\s*\d|限时价|新人价|近\s*\d+\s*天|全网\s*\d|\d+\+件|退货包运费|先采后付|回头率\s*\d|商品复购率|下单返)/;
+  const productName = normalized.split(commercialInfo, 1)[0]?.trim();
+  return productName || normalized;
 }
 function OfferTable({ offers }: { offers: Offer[] }) {
   const [status, setStatus] = useState<"ALL" | "PASS" | "RISK" | "REJECT">(

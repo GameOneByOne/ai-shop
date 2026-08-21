@@ -13,18 +13,20 @@ const priority = {
   WATCH: 2,
   REJECT: 1,
 } as const;
-export async function GET() {
+export async function GET(request: Request) {
   const db = await createClient(),
     { data: auth } = await db.auth.getUser();
   if (!auth.user) return Response.json({ error: "请先登录" }, { status: 401 });
-  const { data: run, error } = await db
+  const selectedRunId = new URL(request.url).searchParams.get("runId");
+  let runQuery = db
     .from("sourcing_runs")
     .select("*")
     .eq("user_id", auth.user.id)
-    .eq("provider", "1688-browser")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+    .eq("provider", "1688-browser");
+  runQuery = selectedRunId
+    ? runQuery.eq("id", selectedRunId)
+    : runQuery.order("created_at", { ascending: false }).limit(1);
+  const { data: run, error } = await runQuery.maybeSingle();
   if (error) return Response.json({ error: error.message }, { status: 500 });
   if (!run)
     return Response.json({

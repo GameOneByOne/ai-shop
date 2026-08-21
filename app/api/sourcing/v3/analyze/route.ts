@@ -5,18 +5,22 @@ import {
   applyAiClusters,
   generateSourcingClusters,
 } from "@/lib/ai/sourcing-cluster";
-export async function POST() {
+export async function POST(request: Request) {
   const db = await createClient(),
     { data: auth } = await db.auth.getUser();
   if (!auth.user) return Response.json({ error: "请先登录" }, { status: 401 });
-  const { data: run } = await db
+  const payload = (await request.json().catch(() => ({}))) as {
+    runId?: string;
+  };
+  let runQuery = db
     .from("sourcing_runs")
     .select("*")
     .eq("user_id", auth.user.id)
-    .eq("provider", "1688-browser")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+    .eq("provider", "1688-browser");
+  runQuery = payload.runId
+    ? runQuery.eq("id", payload.runId)
+    : runQuery.order("created_at", { ascending: false }).limit(1);
+  const { data: run } = await runQuery.maybeSingle();
   if (!run)
     return Response.json(
       { error: "没有可重新分析的真实 SourcingRun；请先完成详情采集" },
@@ -67,31 +71,39 @@ export async function POST() {
     ruleGraph = buildSourcingV3(qualifiedRows, String(run.query ?? "")),
     input = {
       analysis_type: "AI_PRODUCT_MODEL_CLUSTERING_V1",
-      prompt_version: "deepseek-product-model-cluster-v2-independent",
+      prompt_version: "doubao-multimodal-product-model-cluster-v1",
       sourcing_run_id: run.id,
       input_references: qualifiedRows.map((x) => x.id),
     };
+  const execution = "MULTIMODAL" as const;
   let graph = ruleGraph,
-    execution: "DEEPSEEK" | "RULE_FALLBACK" = "RULE_FALLBACK",
-    actualModel = "parser-rule-v3-fallback",
-    fallbackReason: string | null = null,
+    actualModel = process.env.VISION_MODEL ?? "vision-model-not-configured",
     latencyMs = Date.now() - started,
     inputTokens: number | undefined,
     outputTokens: number | undefined;
   try {
     const generated = await generateSourcingClusters(
       ruleGraph,
-      String(run.query ?? ""),
+      qualifiedRows,
     );
     graph = applyAiClusters(ruleGraph, generated.data);
-    execution = "DEEPSEEK";
     actualModel = generated.model;
     latencyMs = generated.latencyMs;
     inputTokens = generated.usage.inputTokens;
     outputTokens = generated.usage.outputTokens;
   } catch (reason) {
-    fallbackReason =
-      reason instanceof Error ? reason.message : "DeepSeek 聚类失败";
+    const cause =
+      reason instanceof Error
+        ? (reason as Error & {
+            cause?: { code?: string; message?: string };
+          }).cause
+        : undefined;
+    const message = reason instanceof Error ? reason.message : "多模态聚类失败";
+    const detail = [cause?.code, cause?.message].filter(Boolean).join(" · ");
+    return Response.json(
+      { error: detail ? `${message}（${detail}）` : message },
+      { status: 502 },
+    );
   }
   const saved = await db
     .from("ai_runs")
@@ -99,13 +111,13 @@ export async function POST() {
       user_id: auth.user.id,
       type: "AI_PRODUCT_MODEL_CLUSTERING_V1",
       model: actualModel,
-      input_json: { ...input, requested_model: "deepseek-v4-pro" },
-      output_json: { graph, execution, fallbackReason },
+      input_json: { ...input, requested_model: process.env.VISION_MODEL },
+      output_json: { graph, execution, fallbackReason: null },
       status: "success",
       latency_ms: latencyMs,
       input_tokens: inputTokens,
       output_tokens: outputTokens,
-      adopted: execution === "DEEPSEEK",
+      adopted: true,
     })
     .select("id")
     .single();
@@ -125,9 +137,9 @@ export async function POST() {
       evidence: graph.models.flatMap((x) => x.evidence),
       counts: graph.counts,
       execution,
-      requestedModel: "deepseek-v4-pro",
+      requestedModel: process.env.VISION_MODEL,
       actualModel,
-      fallbackReason,
+      fallbackReason: null,
     },
     adopted: false,
   });
@@ -138,13 +150,20 @@ export async function POST() {
     .update({
       criteria: {
         ...oldCriteria,
+        pipeline: {
+          ...pipeline,
+          stage3Status: "COMPLETED",
+          stage3Version: Number(pipeline.stage3Version ?? 0) + 1,
+          stage3CompletedAt: new Date().toISOString(),
+          stage3InputStage2Version: Number(pipeline.stage2Version ?? 0),
+        },
         sourcingV3: {
           stage2Version: Number(pipeline.stage2Version ?? 0),
           graph,
           execution,
-          requestedModel: "deepseek-v4-pro",
+          requestedModel: process.env.VISION_MODEL,
           actualModel,
-          fallbackReason,
+          fallbackReason: null,
           analyzedAt: new Date().toISOString(),
           analysisRunId: saved.data.id,
         },
@@ -162,9 +181,9 @@ export async function POST() {
     graph,
     meta: {
       execution,
-      requestedModel: "deepseek-v4-pro",
+      requestedModel: process.env.VISION_MODEL,
       actualModel,
-      fallbackReason,
+      fallbackReason: null,
       latencyMs,
     },
   });

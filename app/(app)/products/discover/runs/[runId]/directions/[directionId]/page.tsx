@@ -76,6 +76,7 @@ function directionPriceRange(direction: ProductDirection) {
 
 export default function DirectionDetailPage() {
   const params = useParams();
+  const runId = String(params.runId || "");
   const directionId = String(params.directionId || "");
 
   const [payload, setPayload] = useState<LatestPayload | null>(null);
@@ -84,7 +85,7 @@ export default function DirectionDetailPage() {
 
   useEffect(() => {
     let mounted = true;
-    void fetch("/api/sourcing/latest")
+    void fetch(`/api/sourcing/latest?runId=${encodeURIComponent(runId)}`)
       .then(async (response) => {
         const body = await response.json();
         if (!mounted) return;
@@ -102,7 +103,7 @@ export default function DirectionDetailPage() {
     return () => {
       mounted = false;
     };
-  }, []);
+  }, [runId]);
 
   const direction = useMemo(() => {
     if (!payload) return null;
@@ -153,7 +154,7 @@ export default function DirectionDetailPage() {
           <h1>{direction.name}</h1>
           <p className="muted">AI 方向判断：{direction.summary ?? direction.marketReason ?? "待核实"}</p>
         </div>
-        <Link className="secondary-btn" href="/products/discover">
+        <Link className="secondary-btn" href={`/products/discover/runs/${runId}`}>
           返回方向列表
         </Link>
       </header>

@@ -512,6 +512,29 @@ async function extractDetails(source, factsOnly = false) {
             )
             .find(Boolean),
           textSnapshot = fallbackSpecs.length === 1 ? fallbackSpecs[0] : null,
+          rawSingleSpecName =
+            (sizeRows.length === 1
+              ? readable(sizeRows[0].innerText)
+              : textSnapshot?.name ?? "")
+              .replace(/[¥￥]\s*\d+(?:\.\d+)?/g, "")
+              .replace(/(?:库存|可售)\s*\d+\s*个?/g, "")
+              .replace(/[-+]?\s*\d+\s*$/, "")
+              .replace(/^(?:规格|尺寸)\s*/, "")
+              .trim(),
+          primaryOptionMentions = colorOptions.filter(([name]) =>
+            rawSingleSpecName.includes(name),
+          ).length,
+          singleSpecName =
+            rawSingleSpecName &&
+            !/^(?:如图[.。]?|默认(?:规格)?|标准(?:规格)?|均码|单一规格|其他)$/i.test(
+              rawSingleSpecName,
+            ) &&
+            primaryOptionMentions <= 1
+              ? rawSingleSpecName
+              : null,
+          variantName = singleSpecName
+            ? `${colorName} / ${singleSpecName}`
+            : colorName,
           image = colorImage.currentSrc || colorImage.src || null,
           price =
             textSnapshot?.price ??
@@ -521,9 +544,11 @@ async function extractDetails(source, factsOnly = false) {
             (rowSnapshot ? Number(rowSnapshot[2]) : null);
         variants.push({
           sourceVariantId: `${source.externalId}:${variants.length + 1}`,
-          variantName: colorName,
-          specValues: [colorName],
-          rawSpecText: colorName,
+          variantName,
+          specValues: singleSpecName
+            ? [colorName, singleSpecName]
+            : [colorName],
+          rawSpecText: variantName,
           rawPriceText: price == null ? null : `¥${price}`,
           price,
           stock,

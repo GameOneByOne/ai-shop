@@ -2,7 +2,6 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
 import type {
   DirectionRecommendation,
   DirectionSourceProduct,
@@ -84,9 +83,9 @@ function labelRecommendation(
 }
 
 function stageText(state: StageState) {
-  if (state === "COMPLETED") return "✓ 完成";
-  if (state === "STALE") return "⚠ 需刷新";
-  return "待运行";
+  if (state === "COMPLETED") return "已完成";
+  if (state === "STALE") return "失败";
+  return "未运行";
 }
 
 function stageValue(state: StageState) {
@@ -131,34 +130,60 @@ function directionCoverage(direction: ProductDirection) {
 }
 
 function stageSummary(pipeline: Pipeline | null) {
-  if (!pipeline) return [];
+  const current = pipeline ?? {
+    stage1Status: "NOT_RUN",
+    stage1Version: 0,
+    stage2Status: "NOT_RUN",
+    stage2Version: 0,
+    stage3Status: "NOT_RUN",
+  };
   return [
     {
-      step: "① 货源粗筛",
-      status: stageText(pipeline.stage1Status as StageState),
+      step: "① 搜索1688",
+      status: stageText(current.stage1Status as StageState),
       value:
-        pipeline.stage1Status === "COMPLETED"
+        current.stage1Status === "COMPLETED"
           ? "1688 搜索结果已采集"
-          : "等待运行粗筛",
-      state: stageValue(pipeline.stage1Status as StageState),
+          : "等待搜索货源",
+      state: stageValue(current.stage1Status as StageState),
     },
     {
-      step: "② 商品解析",
-      status: stageText(pipeline.stage2Status as StageState),
+      step: "② 获取商品与SKU",
+      status: stageText(current.stage2Status as StageState),
       value:
-        pipeline.stage2Status === "COMPLETED"
-          ? `Offer 与 SKU 已解析 · v${pipeline.stage2Version}`
+        current.stage2Status === "COMPLETED"
+          ? `商品与采购 SKU 已获取 · v${current.stage2Version}`
           : "等待解析商品",
-      state: stageValue(pipeline.stage2Status as StageState),
+      state: stageValue(current.stage2Status as StageState),
+    },
+    {
+      step: "③ AI选款方向",
+      status: stageText(current.stage3Status as StageState),
+      value:
+        current.stage3Status === "COMPLETED"
+          ? "AI 选款方向与商品款型池已更新"
+          : "等待 AI 选款方向",
+      state: stageValue(current.stage3Status as StageState),
     },
   ];
 }
 
-export function SourcingDiscovery() {
-  const router = useRouter();
-  const [query, setQuery] = useState("猫隧道");
+export function SourcingDiscovery({
+  compact = false,
+  createMode = false,
+  initialRunId,
+  onDataChange,
+}: {
+  compact?: boolean;
+  createMode?: boolean;
+  initialRunId?: string;
+  onDataChange?: () => void | Promise<void>;
+} = {}) {
+  const [query, setQuery] = useState(createMode ? "" : "猫隧道");
   const [keywordText, setKeywordText] = useState(
-    "猫隧道\n猫咪隧道\n宠物隧道\n可折叠猫隧道\n猫玩具隧道",
+    createMode
+      ? ""
+      : "猫隧道\n猫咪隧道\n宠物隧道\n可折叠猫隧道\n猫玩具隧道",
   );
   const [items, setItems] = useState<Item[]>([]);
   const [directions, setDirections] = useState<ProductDirection[]>([]);
@@ -201,7 +226,10 @@ export function SourcingDiscovery() {
   }
 
   async function loadLatest() {
-    const response = await fetch("/api/sourcing/latest");
+    const url = initialRunId
+      ? `/api/sourcing/latest?runId=${encodeURIComponent(initialRunId)}`
+      : "/api/sourcing/latest";
+    const response = await fetch(url);
     const body = await response.json();
     if (!response.ok) throw new Error(body.error ?? "读取最近任务失败");
     if (!body.runId) return;
@@ -216,8 +244,12 @@ export function SourcingDiscovery() {
   }
 
   useEffect(() => {
+    if (createMode) return;
     let active = true;
-    void fetch("/api/sourcing/latest")
+    const url = initialRunId
+      ? `/api/sourcing/latest?runId=${encodeURIComponent(initialRunId)}`
+      : "/api/sourcing/latest";
+    void fetch(url)
       .then(async (response) => {
         const body = await response.json();
         if (!response.ok) throw new Error(body.error ?? "读取最近任务失败");
@@ -238,6 +270,22 @@ export function SourcingDiscovery() {
     return () => {
       active = false;
     };
+  }, [createMode, initialRunId]);
+
+  useEffect(() => {
+    const resetTask = () => {
+      setQuery("");
+      setKeywordText("");
+      setRunId("");
+      setItems([]);
+      setStats(null);
+      setPipeline(null);
+      setError("");
+      setProgress("");
+    };
+    window.addEventListener("ai-shop:new-sourcing-task", resetTask);
+    return () =>
+      window.removeEventListener("ai-shop:new-sourcing-task", resetTask);
   }, []);
 
   useEffect(() => {
@@ -295,6 +343,7 @@ export function SourcingDiscovery() {
             startDetailCapture(body.products ?? [], body.runId, "facts");
             return;
           }
+          await onDataChange?.();
           const failedCount = Array.isArray(event.data.failures)
             ? event.data.failures.length
             : 0;
@@ -318,7 +367,7 @@ export function SourcingDiscovery() {
 
     window.addEventListener("message", receive);
     return () => window.removeEventListener("message", receive);
-  }, [keywordText, query, runId]);
+  }, [keywordText, onDataChange, query, runId]);
 
   useEffect(
     () => () => {
@@ -489,19 +538,24 @@ export function SourcingDiscovery() {
     );
   }
 
-  async function clusterProductModels() {
+  async function runAiSelectionDirections() {
     setClustering(true);
     setError("");
-    setProgress("正在聚类 SourceSKU 并生成商品款型池…");
+    setProgress("正在发送低分辨率商品图片并进行多模态款型聚类…");
     try {
-      const response = await fetch("/api/sourcing/v3/analyze", {
+      const analyzeResponse = await fetch("/api/sourcing/v3/analyze", {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runId }),
       });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.error ?? "商品款型聚类失败");
-      router.push("/products/discover");
+      const analyzeBody = await analyzeResponse.json();
+      if (!analyzeResponse.ok)
+        throw new Error(analyzeBody.error ?? "商品款型聚类失败");
+      await loadLatest();
+      await onDataChange?.();
+      setProgress("多模态商品款型聚类已完成，货源工作区已刷新。");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "商品款型聚类失败");
+      setError(reason instanceof Error ? reason.message : "AI 选款方向失败");
       setProgress("");
     } finally {
       setClustering(false);
@@ -553,11 +607,18 @@ export function SourcingDiscovery() {
   }, [items]);
 
   const stageSteps = stageSummary(pipeline).map((step, index) =>
-    busy === "details" && index === 1
+    ((busy === "offers" || busy === "facts") && index === 0) ||
+    (busy === "details" && index === 1) ||
+    (clustering && index === 2)
       ? {
           ...step,
-          status: "解析中",
-          value: "正在逐个读取子产品、价格、库存和图片",
+          status: "运行中",
+          value:
+            index === 0
+              ? "正在搜索并筛选 1688 Offer"
+              : index === 1
+                ? "正在逐个读取商品、SKU、价格、库存和图片"
+                : "正在复核选款方向并更新商品款型池",
           state: "PROCESSING",
         }
       : step,
@@ -565,8 +626,11 @@ export function SourcingDiscovery() {
 
   return (
     <>
-      <section className="sourcing-task-form">
-        <h2>选品任务工作台</h2>
+      <section
+        className={`sourcing-task-form${compact ? " compact" : ""}`}
+        id={compact ? "sourcing-task" : undefined}
+      >
+        <h2>货源任务</h2>
         <label>
           任务名称
           <input
@@ -589,11 +653,7 @@ export function SourcingDiscovery() {
             disabled={Boolean(busy)}
             onClick={() => begin("offers")}
           >
-            {busy === "offers"
-              ? "正在搜索 1688 货源…"
-              : stats
-                ? "重新搜索 1688 货源"
-                : "1. 搜索 1688 货源"}
+            {busy === "offers" ? "正在搜索 1688 货源…" : "搜索1688货源"}
           </button>
           <button
             className={busy === "details" ? "btn" : "secondary-btn"}
@@ -602,7 +662,7 @@ export function SourcingDiscovery() {
           >
             {busy === "details"
               ? `正在解析 ${captureProgress?.completed ?? 0}/${captureProgress?.total ?? 0}`
-              : "2. 解析通过筛选的商品与 SKU"}
+              : "获取商品与SKU"}
           </button>
           <button
             className="secondary-btn"
@@ -612,28 +672,26 @@ export function SourcingDiscovery() {
               pipeline?.stage2Status !== "COMPLETED" ||
               !stats?.sourceSkus
             }
-            onClick={() => void clusterProductModels()}
+            onClick={() => void runAiSelectionDirections()}
           >
-            {clustering ? "正在聚类商品款型…" : "3. AI 聚类商品款型池"}
+            {clustering ? "正在生成选款方向…" : "AI选款方向"}
           </button>
         </div>
 
-        {pipeline && (
-          <div className="stepper">
-            {stageSteps.map((item) => (
-              <div
-                className={`stepper-item ${item.state.toLowerCase()}`}
-                key={item.step}
-              >
-                <div>
-                  <b>{item.step}</b>
-                  <span>{item.status}</span>
-                </div>
-                <small>{item.value}</small>
+        <div className="stepper">
+          {stageSteps.map((item) => (
+            <div
+              className={`stepper-item ${item.state.toLowerCase()}`}
+              key={item.step}
+            >
+              <div>
+                <b>{item.step}</b>
+                <span>{item.status}</span>
               </div>
-            ))}
-          </div>
-        )}
+              <small>{item.value}</small>
+            </div>
+          ))}
+        </div>
 
         {busy && captureProgress && (
           <div className="capture-progress" aria-live="polite">
@@ -666,7 +724,7 @@ export function SourcingDiscovery() {
         )}
       </section>
 
-      {stats && (
+      {!compact && stats && (
         <section className="sourcing-kpis" aria-label="选品任务数据统计">
           <div>
             <b>{stats.fetched}</b>
@@ -687,7 +745,7 @@ export function SourcingDiscovery() {
         </section>
       )}
 
-      {items.length > 0 && (
+      {!compact && items.length > 0 && (
         <section className="card raw-results offer-pool-workbench">
           <div className="offer-admission-summary">
             <div>
