@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   DirectionRecommendation,
@@ -60,12 +61,28 @@ interface Pipeline {
   stage1Version: number;
   stage2Status: string;
   stage2Version: number;
+  attributeStatus: string;
   stage3Status: string;
 }
 
 type CaptureMode = "offers" | "facts" | "details";
 
-type StageState = "NOT_RUN" | "COMPLETED" | "STALE";
+
+function readableCaptureError(value: unknown): string {
+  if (typeof value === "string" && value.trim()) return value;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if (record.message !== value) {
+      const message = readableCaptureError(record.message);
+      if (message !== "未知采集错误") return message;
+    }
+    try {
+      const serialized = JSON.stringify(value);
+      if (serialized && serialized !== "{}") return serialized;
+    } catch {}
+  }
+  return "未知采集错误";
+}
 
 function isReviewDone(direction: ProductDirection) {
   return Boolean(direction.reviewedAt && direction.recommendation);
@@ -80,18 +97,6 @@ function labelRecommendation(
     WATCH: "观察",
     REJECT: "不建议",
   }[value ?? "WATCH"];
-}
-
-function stageText(state: StageState) {
-  if (state === "COMPLETED") return "已完成";
-  if (state === "STALE") return "失败";
-  return "未运行";
-}
-
-function stageValue(state: StageState) {
-  if (state === "COMPLETED") return "COMPLETED";
-  if (state === "STALE") return "STALE";
-  return "NOT_RUN";
 }
 
 function formatMoney(value: number | null | undefined) {
@@ -129,44 +134,24 @@ function directionCoverage(direction: ProductDirection) {
   return { totalSku, trustedSku, verifiedOffer };
 }
 
-function stageSummary(pipeline: Pipeline | null) {
-  const current = pipeline ?? {
-    stage1Status: "NOT_RUN",
-    stage1Version: 0,
-    stage2Status: "NOT_RUN",
-    stage2Version: 0,
-    stage3Status: "NOT_RUN",
-  };
-  return [
-    {
-      step: "① 搜索1688",
-      status: stageText(current.stage1Status as StageState),
-      value:
-        current.stage1Status === "COMPLETED"
-          ? "1688 搜索结果已采集"
-          : "等待搜索货源",
-      state: stageValue(current.stage1Status as StageState),
-    },
-    {
-      step: "② 获取商品与SKU",
-      status: stageText(current.stage2Status as StageState),
-      value:
-        current.stage2Status === "COMPLETED"
-          ? `商品与采购 SKU 已获取 · v${current.stage2Version}`
-          : "等待解析商品",
-      state: stageValue(current.stage2Status as StageState),
-    },
-    {
-      step: "③ AI选款方向",
-      status: stageText(current.stage3Status as StageState),
-      value:
-        current.stage3Status === "COMPLETED"
-          ? "AI 选款方向与商品款型池已更新"
-          : "等待 AI 选款方向",
-      state: stageValue(current.stage3Status as StageState),
-    },
-  ];
-}
+const DEFAULT_SEARCH_FLAGS = ["一件代发", "退货包运费", "7天无理由退货"] as const;
+const defaultSearchOptions = () => ({
+  sort: "综合",
+  priceMin: "",
+  priceMax: "",
+  minOrder: "",
+  shopProductMin: "",
+  shopProductMax: "",
+  region: "",
+  merchantFeature: "",
+  businessMode: "",
+  encryptedWaybill: "",
+  latePickupCompensation: "",
+  pickup24Rate: "",
+  pickup48Rate: "",
+  mergeSuppliers: false,
+  flags: [...DEFAULT_SEARCH_FLAGS] as string[],
+});
 
 export function SourcingDiscovery({
   compact = false,
@@ -179,12 +164,16 @@ export function SourcingDiscovery({
   initialRunId?: string;
   onDataChange?: () => void | Promise<void>;
 } = {}) {
+  const router = useRouter();
   const [query, setQuery] = useState(createMode ? "" : "猫隧道");
   const [keywordText, setKeywordText] = useState(
     createMode
       ? ""
       : "猫隧道\n猫咪隧道\n宠物隧道\n可折叠猫隧道\n猫玩具隧道",
   );
+  const [targetOfferCount, setTargetOfferCount] = useState(20);
+  const [searchPrepared, setSearchPrepared] = useState(!createMode);
+  const [searchOptions, setSearchOptions] = useState(defaultSearchOptions);
   const [items, setItems] = useState<Item[]>([]);
   const [directions, setDirections] = useState<ProductDirection[]>([]);
   const [runId, setRunId] = useState("");
@@ -192,6 +181,8 @@ export function SourcingDiscovery({
   const [pipeline, setPipeline] = useState<Pipeline | null>(null);
   const [busy, setBusy] = useState<CaptureMode | null>(null);
   const [progress, setProgress] = useState("");
+  const [captureStartedAt, setCaptureStartedAt] = useState<number | null>(null);
+  const [captureNow, setCaptureNow] = useState(0);
   const [captureProgress, setCaptureProgress] = useState<{
     completed: number;
     total: number;
@@ -200,6 +191,7 @@ export function SourcingDiscovery({
   } | null>(null);
   const [error, setError] = useState("");
   const [clustering, setClustering] = useState(false);
+  const [parsingAttributes, setParsingAttributes] = useState(false);
   const [filter, setFilter] = useState("ALL");
   const [sort, setSort] = useState("score");
   const [requirements, setRequirements] = useState({
@@ -213,6 +205,77 @@ export function SourcingDiscovery({
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const requestRef = useRef<string | null>(null);
   const modeRef = useRef<CaptureMode>("offers");
+  const activeRunRef = useRef(initialRunId ?? "");
+  const lastCaptureStageRef = useRef("");
+  useEffect(() => {
+    if (!busy || captureStartedAt == null) return;
+    const interval = window.setInterval(() => setCaptureNow(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, [busy, captureStartedAt]);
+
+  function armCaptureWatchdog(
+    requestId: string,
+    mode: CaptureMode,
+    delay: number,
+    waitingForFirstHeartbeat = false,
+  ) {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(() => {
+      if (requestRef.current !== requestId) return;
+      window.postMessage(
+        { type: "AI_SHOP_CANCEL_CAPTURE", requestId },
+        location.origin,
+      );
+      requestRef.current = null;
+      setBusy(null);
+      setCaptureProgress(null);
+      setProgress("");
+      const lastStage = lastCaptureStageRef.current;
+      setError(
+        waitingForFirstHeartbeat
+          ? "采集桥未响应。扩展更新后需要刷新当前 AI 店长页面，再重新搜索"
+          : `${mode === "offers" ? "Offer 采集" : "详情解析"}在“${lastStage || "启动"}”阶段停止响应，请检查对应的 1688 页面`,
+      );
+    }, delay);
+  }
+
+  function prepareSearch() {
+    if (!query.trim()) {
+      setError("请先输入要搜索的商品");
+      return;
+    }
+    setSearchPrepared(true);
+    setKeywordText(query.trim());
+    setError("");
+  }
+
+  function cancelCapture() {
+    const activeRequestId = requestRef.current;
+    requestRef.current = null;
+    if (timer.current) {
+      clearTimeout(timer.current);
+      timer.current = null;
+    }
+    if (activeRequestId) {
+      window.postMessage(
+        { type: "AI_SHOP_CANCEL_CAPTURE", requestId: activeRequestId },
+        location.origin,
+      );
+    }
+    setBusy(null);
+    setCaptureProgress(null);
+    setError("");
+    setProgress("本轮搜索已取消，可以修改条件后重新搜索。");
+  }
+
+  function toggleSearchFlag(value: string) {
+    setSearchOptions((current) => ({
+      ...current,
+      flags: current.flags.includes(value)
+        ? current.flags.filter((item) => item !== value)
+        : [...current.flags, value],
+    }));
+  }
 
   async function post(url: string, data: object) {
     const response = await fetch(url, {
@@ -276,6 +339,8 @@ export function SourcingDiscovery({
     const resetTask = () => {
       setQuery("");
       setKeywordText("");
+      setTargetOfferCount(20);
+      setSearchOptions(defaultSearchOptions());
       setRunId("");
       setItems([]);
       setStats(null);
@@ -296,15 +361,21 @@ export function SourcingDiscovery({
       )
         return;
       if (event.data?.type === "AI_SHOP_CAPTURE_PROGRESS") {
+        const progressMessage = event.data.message ||
+          `已处理 ${event.data.completed}/${event.data.total} 个 Offer（成功 ${event.data.succeeded}，失败 ${event.data.failed}）`;
+        lastCaptureStageRef.current = progressMessage;
+        armCaptureWatchdog(
+          event.data.requestId,
+          modeRef.current,
+          modeRef.current === "offers" ? 65000 : 125000,
+        );
         setCaptureProgress({
           completed: Number(event.data.completed ?? 0),
           total: Number(event.data.total ?? 0),
           succeeded: Number(event.data.succeeded ?? 0),
           failed: Number(event.data.failed ?? 0),
         });
-        setProgress(
-          `已处理 ${event.data.completed}/${event.data.total} 个 Offer（成功 ${event.data.succeeded}，失败 ${event.data.failed}）`,
-        );
+        setProgress(progressMessage);
         return;
       }
       if (event.data?.type !== "AI_SHOP_CAPTURE_RESULT") return;
@@ -314,19 +385,23 @@ export function SourcingDiscovery({
       if (event.data.error) {
         setBusy(null);
         setCaptureProgress(null);
-        setError(event.data.error);
+        setProgress("");
+        const version = event.data.extensionVersion
+          ? `（扩展 v${String(event.data.extensionVersion)}）`
+          : "";
+        setError(`${readableCaptureError(event.data.error)}${version}`);
         return;
       }
       const keywords = keywordText
         .split(/[\n,，]/)
         .map((x) => x.trim())
-        .filter(Boolean)
-        .slice(0, 5);
+        .filter(Boolean);
       const operation =
         completedMode === "offers"
           ? post("/api/sourcing/browser-import", {
               query,
               keywords,
+              targetOfferCount,
               collection: event.data.collection,
               items: event.data.items,
             })
@@ -340,10 +415,15 @@ export function SourcingDiscovery({
         .then(async (body) => {
           await loadLatest();
           if (completedMode === "offers") {
-            startDetailCapture(body.products ?? [], body.runId, "facts");
+            // 搜索页是两步中转页：搜索 Offer 后必须继续抓取完整商品详情。
+            // facts 模式只会保存资格快照，不包含 rawOptions/SKU，因此结果页会大量显示“待获取”。
+            startDetailCapture(body.products ?? [], body.runId, "details");
             return;
           }
           await onDataChange?.();
+          const completedRunId = activeRunRef.current || runId;
+          if (createMode && completedRunId)
+            router.push(`/products/discover/runs/${encodeURIComponent(completedRunId)}`);
           const failedCount = Array.isArray(event.data.failures)
             ? event.data.failures.length
             : 0;
@@ -367,7 +447,7 @@ export function SourcingDiscovery({
 
     window.addEventListener("message", receive);
     return () => window.removeEventListener("message", receive);
-  }, [keywordText, onDataChange, query, runId]);
+  }, [createMode, keywordText, onDataChange, query, router, runId, targetOfferCount]);
 
   useEffect(
     () => () => {
@@ -376,31 +456,14 @@ export function SourcingDiscovery({
     [],
   );
 
-  function matchesRequirements(item: Item) {
-    if (requirements.onePiece && item.one_piece_delivery !== true) return false;
-    if (requirements.blind && item.blind_shipping !== true) return false;
-    if (
-      requirements.returns &&
-      item.return_shipping !== true &&
-      item.no_reason_return !== true
-    )
-      return false;
-    if (requirements.stock && (item.stock ?? 0) <= 100) return false;
-    if (requirements.shopAge && (item.shop_age ?? 0) <= 1) return false;
-    return true;
-  }
-
   function startDetailCapture(
     sourceItems: Item[],
     targetRunId: string,
     captureMode: "facts" | "details",
   ) {
     const parseCandidates = sourceItems
-      .filter((x) =>
-        captureMode === "facts"
-          ? ["valid", "needs_review"].includes(x.data_status)
-          : x.offer_status === "PASS" && matchesRequirements(x),
-      )
+      // 搜索条件已由 1688 页面应用。此处不能在详情字段尚未解析时
+      // 再用空值做一次本地过滤，否则真实 Offer 会在解析前被误删。
       .sort((a, b) => b.rough_score - a.rough_score)
       .slice(0, 50)
       .map((x) => ({
@@ -415,7 +478,7 @@ export function SourcingDiscovery({
       setError(
         captureMode === "facts"
           ? "本次搜索没有可采集资质的 Offer"
-          : "当前筛选条件下没有通过准入的 Offer",
+          : "本次搜索没有可解析详情的 Offer",
       );
       return;
     }
@@ -424,11 +487,12 @@ export function SourcingDiscovery({
     requestRef.current = id;
     modeRef.current = captureMode;
     setRunId(targetRunId);
+    activeRunRef.current = targetRunId;
     setBusy(captureMode);
     setDirections([]);
     setProgress(
       captureMode === "facts"
-        ? "正在采集 Offer 与店铺资质并执行准入筛选…"
+        ? `正在获取 ${sourceItems.length} 个 Offer 详情（本轮目标 ${targetOfferCount} 个）…`
         : "正在解析筛选通过的商品与采购 SKU…",
     );
     setCaptureProgress({
@@ -449,6 +513,10 @@ export function SourcingDiscovery({
     );
 
     timer.current = setTimeout(() => {
+      window.postMessage(
+        { type: "AI_SHOP_CANCEL_CAPTURE", requestId: id },
+        location.origin,
+      );
       requestRef.current = null;
       setBusy(null);
       setCaptureProgress(null);
@@ -458,24 +526,26 @@ export function SourcingDiscovery({
           ? "店铺资质采集超时，请检查 1688 登录状态后重新搜索"
           : "商品解析超时，请检查采集桥状态后重试",
       );
-    }, 480000);
+    }, 420000);
   }
 
   function begin(mode: CaptureMode) {
-    const keywords = keywordText
+    const keywords = (createMode ? query : keywordText)
       .split(/[\n,，]/)
       .map((x) => x.trim())
-      .filter(Boolean)
-      .slice(0, 5);
-    if (mode === "offers" && keywords.length < 3) {
-      setError("每个品类请填写 3～5 个关键词");
+      .filter(Boolean);
+    if (mode === "offers" && !keywords.length) {
+      setError("请至少填写一个搜索关键词");
       return;
     }
 
     const id = crypto.randomUUID();
     requestRef.current = id;
     modeRef.current = mode;
+    lastCaptureStageRef.current = "";
     setBusy(mode);
+    setCaptureStartedAt(Date.now());
+    setCaptureNow(Date.now());
     setCaptureProgress({
       completed: 0,
       total:
@@ -486,11 +556,7 @@ export function SourcingDiscovery({
                 ["valid", "needs_review"].includes(x.data_status),
               ).length,
             )
-          : keywordText
-              .split(/[\n,，]/)
-              .map((x) => x.trim())
-              .filter(Boolean)
-              .slice(0, 5).length,
+          : keywords.length,
       succeeded: 0,
       failed: 0,
     });
@@ -513,7 +579,9 @@ export function SourcingDiscovery({
           requestId: id,
           query,
           keywords,
-          maxPages: 3,
+          targetOfferCount,
+          filters: searchOptions,
+          maxPages: 30,
         },
         location.origin,
       );
@@ -522,20 +590,7 @@ export function SourcingDiscovery({
       return;
     }
 
-    timer.current = setTimeout(
-      () => {
-        requestRef.current = null;
-        setBusy(null);
-        setCaptureProgress(null);
-        setProgress("");
-        setError(
-          mode === "offers"
-            ? "Offer 采集超时，请检查 1688 登录状态"
-            : "解析超时，请检查采集桥状态",
-        );
-      },
-      mode === "offers" ? 180000 : 480000,
-    );
+    armCaptureWatchdog(id, mode, 15000, true);
   }
 
   async function runAiSelectionDirections() {
@@ -559,6 +614,24 @@ export function SourcingDiscovery({
       setProgress("");
     } finally {
       setClustering(false);
+    }
+  }
+
+  async function runAttributeParsing() {
+    setParsingAttributes(true);
+    setError("");
+    setProgress("DeepSeek 正在根据商品名与 SourceSKU 文字解析商品属性…");
+    try {
+      await post("/api/sourcing/v3/attributes", { runId });
+      await loadLatest();
+      await onDataChange?.();
+      setProgress("DeepSeek 商品属性解析已完成。");
+    } catch (reason) {
+      await loadLatest().catch(() => undefined);
+      setError(reason instanceof Error ? reason.message : "商品属性解析失败");
+      setProgress("");
+    } finally {
+      setParsingAttributes(false);
     }
   }
 
@@ -606,105 +679,137 @@ export function SourcingDiscovery({
     };
   }, [items]);
 
-  const stageSteps = stageSummary(pipeline).map((step, index) =>
-    ((busy === "offers" || busy === "facts") && index === 0) ||
-    (busy === "details" && index === 1) ||
-    (clustering && index === 2)
-      ? {
-          ...step,
-          status: "运行中",
-          value:
-            index === 0
-              ? "正在搜索并筛选 1688 Offer"
-              : index === 1
-                ? "正在逐个读取商品、SKU、价格、库存和图片"
-                : "正在复核选款方向并更新商品款型池",
-          state: "PROCESSING",
-        }
-      : step,
-  );
-
   return (
     <>
       <section
         className={`sourcing-task-form${compact ? " compact" : ""}`}
         id={compact ? "sourcing-task" : undefined}
       >
-        <h2>货源任务</h2>
-        <label>
-          任务名称
+        <h2>{createMode ? "搜索 1688" : "货源任务"}</h2>
+        <label className={createMode ? "sourcing-search-main" : undefined}>
+          {createMode ? <span>在 1688 找货源</span> : "任务名称"}
+          <div className={createMode ? "sourcing-search-box" : undefined}>
           <input
             className="input"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            placeholder={createMode ? "例如：猫隧道" : undefined}
+            onChange={(e) => {
+              const next = e.target.value;
+              setQuery(next);
+              if (searchPrepared) setKeywordText(next.trim());
+            }}
+            onKeyDown={(event) => {
+              if (createMode && event.key === "Enter") {
+                event.preventDefault();
+                prepareSearch();
+                begin("offers");
+              }
+            }}
           />
+          {createMode && <button type="button" disabled={Boolean(busy) || !query.trim()} onClick={() => { if (!searchPrepared) prepareSearch(); begin("offers"); }}>{busy === "offers" ? "正在搜索…" : "搜索1688"}</button>}
+          </div>
         </label>
-        <label>
-          搜索关键词（每行一个，3～5 个）
+        {createMode && (
+          <div className="sourcing-search-filters" aria-label="1688 搜索筛选">
+            <div className="sourcing-search-toolbar">
+              <div className="sourcing-search-sort" aria-label="排序方式">{(["综合", "销量", "价格"] as const).map((value) => <button type="button" className={searchOptions.sort === value ? "active" : ""} key={value} onClick={() => setSearchOptions((current) => ({...current, sort:value}))}>{value}</button>)}</div>
+              <label className="sourcing-check"><input type="checkbox" checked={searchOptions.mergeSuppliers} onChange={(event) => setSearchOptions((current) => ({...current,mergeSuppliers:event.target.checked}))} />合并同款供应商</label>
+            </div>
+            <div className="sourcing-search-condition-row"><b>采购条件</b><div><label>价格<input className="input" inputMode="decimal" placeholder="最低价" value={searchOptions.priceMin} onChange={(event) => setSearchOptions((current) => ({...current,priceMin:event.target.value}))} /><i>—</i><input className="input" inputMode="decimal" placeholder="最高价" value={searchOptions.priceMax} onChange={(event) => setSearchOptions((current) => ({...current,priceMax:event.target.value}))} /></label><label>起订量<input className="input" type="number" min={1} placeholder="不限" value={searchOptions.minOrder} onChange={(event) => setSearchOptions((current) => ({...current,minOrder:event.target.value}))} /></label><label>店铺商品数<input className="input" inputMode="numeric" placeholder="最低" value={searchOptions.shopProductMin} onChange={(event) => setSearchOptions((current) => ({...current,shopProductMin:event.target.value}))} /><i>—</i><input className="input" inputMode="numeric" placeholder="最高" value={searchOptions.shopProductMax} onChange={(event) => setSearchOptions((current) => ({...current,shopProductMax:event.target.value}))} /></label></div></div>
+            <div className="sourcing-search-condition-row"><b>供应商</b><div><label>所在地区<select className="input" value={searchOptions.region} onChange={(event) => setSearchOptions((current) => ({...current,region:event.target.value}))}><option value="">全部地区</option>{["浙江","广东","江苏","山东","河北","河南","福建","安徽","上海","北京"].map((value)=><option key={value}>{value}</option>)}</select></label><label>商家特色<select className="input" value={searchOptions.merchantFeature} onChange={(event) => setSearchOptions((current) => ({...current,merchantFeature:event.target.value}))}><option value="">全部商家</option>{["超级工厂","实力商家","深度验厂","源头工厂","源头旗舰"].map((value)=><option key={value}>{value}</option>)}</select></label><label>经营模式<select className="input" value={searchOptions.businessMode} onChange={(event) => setSearchOptions((current) => ({...current,businessMode:event.target.value}))}><option value="">全部模式</option><option>生产加工</option><option>经销批发</option><option>招商代理</option><option>商业服务</option></select></label></div></div>
+            <div className="sourcing-search-condition-row"><b>特色服务</b><div className="sourcing-search-flags">{[...DEFAULT_SEARCH_FLAGS, "极速开票", "新人首单优惠", "新品", "包邮", "1688严选", "分销严选", "48H发货", "官方物流", "铺货素材包"].map((value) => <button type="button" className={searchOptions.flags.includes(value)?"active":""} aria-pressed={searchOptions.flags.includes(value)} key={value} onClick={() => toggleSearchFlag(value)}>{value}</button>)}</div></div>
+            <div className="sourcing-search-condition-row"><b>代发履约</b><div><label>密文面单<select className="input" value={searchOptions.encryptedWaybill} onChange={(event) => setSearchOptions((current) => ({...current,encryptedWaybill:event.target.value}))}><option value="">不限</option><option>淘宝密文面单</option><option>抖音密文面单</option><option>拼多多密文面单</option><option>快手密文面单</option></select></label><label>晚揽必赔<select className="input" value={searchOptions.latePickupCompensation} onChange={(event) => setSearchOptions((current) => ({...current,latePickupCompensation:event.target.value}))}><option value="">不限</option><option value="晚揽必赔">支持晚揽必赔</option></select></label><label>24H支揽率<select className="input" value={searchOptions.pickup24Rate} onChange={(event) => setSearchOptions((current) => ({...current,pickup24Rate:event.target.value}))}><option value="">不限</option><option value="80%">≥ 80%</option><option value="90%">≥ 90%</option><option value="95%">≥ 95%</option></select></label><label>48H支揽率<select className="input" value={searchOptions.pickup48Rate} onChange={(event) => setSearchOptions((current) => ({...current,pickup48Rate:event.target.value}))}><option value="">不限</option><option value="80%">≥ 80%</option><option value="90%">≥ 90%</option><option value="95%">≥ 95%</option></select></label></div></div>
+            </div>
+        )}
+        {!createMode && <label>
+          搜索关键词（每行一个，数量不限）
           <textarea
             className="input textarea"
             value={keywordText}
             onChange={(e) => setKeywordText(e.target.value)}
           />
+        </label>}
+        <label>
+          本轮目标商品数
+          <input
+            className="input"
+            type="number"
+            min={1}
+            max={500}
+            value={targetOfferCount}
+            onChange={(event) => setTargetOfferCount(Math.max(1, Math.min(500, Number(event.target.value) || 1)))}
+          />
+          <small>默认 20。多个关键词累计去重，每个新 Offer 计 1 个，达到数量后停止搜索。</small>
         </label>
         <div className="auth-actions">
-          <button
+          {!createMode && <button
             className={busy === "details" ? "secondary-btn" : "btn"}
-            disabled={Boolean(busy)}
-            onClick={() => begin("offers")}
+            disabled={Boolean(busy) || (createMode && !query.trim())}
+            onClick={() => {
+              if (!searchPrepared) prepareSearch();
+              begin("offers");
+            }}
           >
-            {busy === "offers" ? "正在搜索 1688 货源…" : "搜索1688货源"}
-          </button>
-          <button
+            {busy
+              ? busy === "offers"
+                ? "正在搜索 1688 货源…"
+                : `正在获取详情 ${captureProgress?.completed ?? 0}/${captureProgress?.total ?? 0}${busy === "facts" ? `（目标 ${targetOfferCount}）` : ""}`
+              : createMode
+                ? "搜索并获取货源详情"
+                : "搜索1688货源"}
+          </button>}
+          {busy && <button
+            type="button"
+            className="secondary-btn sourcing-cancel-btn"
+            onClick={cancelCapture}
+          >
+            取消搜索
+          </button>}
+          {!createMode && <button
             className={busy === "details" ? "btn" : "secondary-btn"}
             disabled={!runId || Boolean(busy) || !items.length}
             onClick={() => begin("details")}
           >
             {busy === "details"
               ? `正在解析 ${captureProgress?.completed ?? 0}/${captureProgress?.total ?? 0}`
-              : "获取商品与SKU"}
-          </button>
-          <button
+              : "获取货源详情"}
+          </button>}
+          {!compact && <button
             className="secondary-btn"
             disabled={
               Boolean(busy) ||
+              parsingAttributes ||
               clustering ||
               pipeline?.stage2Status !== "COMPLETED" ||
+              !stats?.sourceSkus
+            }
+            onClick={() => void runAttributeParsing()}
+          >
+            {parsingAttributes ? "正在解析商品属性…" : "DeepSeek解析商品属性"}
+          </button>}
+          {!compact && <button
+            className="secondary-btn"
+            disabled={
+              Boolean(busy) ||
+              parsingAttributes ||
+              clustering ||
+              pipeline?.attributeStatus !== "COMPLETED" ||
               !stats?.sourceSkus
             }
             onClick={() => void runAiSelectionDirections()}
           >
             {clustering ? "正在生成选款方向…" : "AI选款方向"}
-          </button>
-        </div>
-
-        <div className="stepper">
-          {stageSteps.map((item) => (
-            <div
-              className={`stepper-item ${item.state.toLowerCase()}`}
-              key={item.step}
-            >
-              <div>
-                <b>{item.step}</b>
-                <span>{item.status}</span>
-              </div>
-              <small>{item.value}</small>
-            </div>
-          ))}
+          </button>}
         </div>
 
         {busy && captureProgress && (
           <div className="capture-progress" aria-live="polite">
             <div>
               <b>
-                {busy === "details"
-                  ? "正在解析通过筛选的商品与 SKU"
-                  : busy === "facts"
-                    ? "正在采集店铺资质并筛选 Offer"
-                    : "正在搜索 1688 货源"}
+                正在获取货源
               </b>
               <span>
-                {captureProgress.completed} / {captureProgress.total || "—"}
+                {captureProgress.completed} / {captureProgress.total || "—"} · 已运行 {(() => { const seconds = Math.max(0, Math.floor((captureNow - (captureStartedAt ?? captureNow)) / 1000)); const minutes = Math.floor(seconds / 60); return minutes ? `${minutes}分${String(seconds % 60).padStart(2, "0")}秒` : `${seconds}秒`; })()}
               </span>
             </div>
             <progress
@@ -712,8 +817,9 @@ export function SourcingDiscovery({
               max={Math.max(1, captureProgress.total)}
             />
             <small>
-              成功 {captureProgress.succeeded}　失败 {captureProgress.failed}
+              已获得有效货源 {captureProgress.succeeded}
             </small>
+            {progress && <p className="capture-progress-stage">{progress}</p>}
           </div>
         )}
 

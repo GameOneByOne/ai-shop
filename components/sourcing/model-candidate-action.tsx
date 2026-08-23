@@ -1,3 +1,40 @@
 "use client";
-import Link from"next/link";import{useEffect,useState}from"react";import{useParams,useRouter}from"next/navigation";import type{SourcingV3Graph}from"@/lib/sourcing/v3";
-export function ModelCandidateAction(){const params=useParams()as Record<string,string>,router=useRouter(),[graph,setGraph]=useState<SourcingV3Graph|null>(null),[busy,setBusy]=useState(false),[message,setMessage]=useState("");useEffect(()=>{void fetch("/api/sourcing/latest").then(r=>r.json()).then(x=>setGraph(x.v3??null))},[]);const model=graph?.models.find(x=>x.id===params.modelId),selection=(()=>{if(!graph||!model)return null;for(const variant of graph.variants.filter(x=>x.modelId===model.id)){const match=variant.matches.find(x=>x.status==="MATCH"),source=match&&graph.sourceSkus.find(x=>x.id===match.sourceSkuId);if(source?.price&&source.price>0)return{variant,source}}return null})();async function add(){if(!model||!selection)return;setBusy(true);setMessage("");try{const{variant,source}=selection,response=await fetch("/api/sourcing/decision",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sourceOfferId:source.offerId,action:"candidate",sourceProduct:{id:model.id,normalizedName:model.name,supplierName:source.supplierName,sourceUrl:source.sourceUrl,directionId:model.id,ruleScore:source.confidence,dataConfidence:source.confidence,verificationNeeded:[source.dimensionStatus==="UNKNOWN"?"尺寸待确认":"",!source.material?"材质待确认":""].filter(Boolean),supportsDropshipping:false,supportsPrivacyDropshipping:null,taskRelevance:"PRIMARY",commercialReadiness:model.sizeCompleteness},sourceSku:{id:source.id,specName:variant.name,price:source.price,priceStatus:"HIGH_CONFIDENCE",shippingFee:null,promotionDiscount:null,dropshipMoq:null,wholesaleMoq:null}})}),body=await response.json();if(!response.ok)throw new Error(body.error??"进入候选商品失败");setMessage("已生成真实 Candidate，并建立 Variant、SourceSKU 与 Supplier 追踪链。");router.refresh()}catch(e){setMessage(e instanceof Error?e.message:"进入候选商品失败")}finally{setBusy(false)}}return <section className="card"><div className="proposal-head"><div><span className="eyebrow">人工选品决策</span><h2>进入候选商品</h2><p className="muted">将携带 ProductVariant、具体 SourceSKU、Supplier、判断证据和缺失项。</p></div><div className="action-buttons"><button className="btn" disabled={busy||!selection} onClick={()=>void add()}>{busy?"写入中…":"进入候选商品"}</button><Link className="secondary-btn button-link" href="/products/candidates">查看候选商品池</Link></div></div>{!selection&&<div className="status-box">当前没有价格有效且达到 MATCH 的 SourceSKU；不能提前生成候选。</div>}{message&&<div className={`status-box ${message.includes("已生成")?"success":"error"}`}>{message}</div>}</section>}
+
+import Link from "next/link";
+import { useEffect, useState } from "react";
+import { useParams } from "next/navigation";
+import type { SourcingV3Graph } from "@/lib/sourcing/v3";
+
+export function ModelCandidateAction() {
+  const params = useParams() as Record<string, string>;
+  const [graph, setGraph] = useState<SourcingV3Graph | null>(null);
+
+  useEffect(() => {
+    void fetch(`/api/sourcing/latest?runId=${encodeURIComponent(params.runId)}`)
+      .then((response) => response.json())
+      .then((body) => setGraph(body.v3 ?? null));
+  }, [params.runId]);
+
+  const modelId = decodeURIComponent(params.modelId);
+  const model = graph?.models.find((item) => item.id === modelId);
+  const href = model
+    ? `/skus?runId=${encodeURIComponent(params.runId)}&modelId=${encodeURIComponent(modelId)}`
+    : "/skus";
+
+  return (
+    <section className="v2-card">
+      <div className="proposal-head">
+        <div>
+          <span className="eyebrow">商品选择</span>
+          <h2>选择商品并进入 SKU 映射</h2>
+          <p className="muted">
+            选择当前款型，进入商品中心建立淘宝 SKU 与 1688 SourceSKU 的映射。
+          </p>
+        </div>
+        <Link className="btn button-link" href={href} aria-disabled={!model}>
+          {model ? "选择商品并进入SKU映射" : "进入SKU映射"}
+        </Link>
+      </div>
+    </section>
+  );
+}

@@ -167,12 +167,19 @@ export async function GET(request: Request) {
       ? criteria.directionReviewHistory
       : [];
   const savedV3 = criteria.sourcingV3 as Record<string, unknown> | undefined;
+  const savedAttributes = criteria.sourcingAttributes as
+    | Record<string, unknown>
+    | undefined;
   const v3 =
     savedV3 &&
     Number(savedV3.stage2Version ?? -1) === currentStage2Version &&
     savedV3.graph
       ? (savedV3.graph as ReturnType<typeof buildSourcingV3>)
-      : buildSourcingV3(qualifiedRows, String(run.query ?? ""));
+      : savedAttributes &&
+          Number(savedAttributes.stage2Version ?? -1) === currentStage2Version &&
+          savedAttributes.graph
+        ? (savedAttributes.graph as ReturnType<typeof buildSourcingV3>)
+        : buildSourcingV3(qualifiedRows, String(run.query ?? ""));
   return Response.json({
     runId: run.id,
     sourcingRunId: run.id,
@@ -200,6 +207,10 @@ export async function GET(request: Request) {
         pipeline.stage2Status ??
         (sourceProducts.length ? "COMPLETED" : "NOT_RUN"),
       stage2Version: currentStage2Version,
+      attributeStatus:
+        Number(pipeline.attributeInputStage2Version ?? -1) === currentStage2Version
+          ? (pipeline.attributeStatus ?? "NOT_RUN")
+          : "NOT_RUN",
       stage3Status: reviewIsCurrent
         ? "COMPLETED"
         : (pipeline.stage3Status ?? "NOT_RUN"),

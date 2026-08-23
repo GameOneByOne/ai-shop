@@ -1,8 +1,32 @@
 "use server";
-import {revalidatePath} from "next/cache";
-import {requireUser} from "@/lib/data/auth";
-import {createClient} from "@/lib/supabase/server";
+import { redirect } from "next/navigation";
+import { requireUser } from "@/lib/data/auth";
+import { createClient } from "@/lib/supabase/server";
 
-export async function reviewListingPackage(formData:FormData){const user=await requireUser();const supabase=await createClient();const id=String(formData.get("id")??""),decision=String(formData.get("decision")??"");if(!id||!["approved","rejected"].includes(decision))throw new Error("审核参数无效");const{data:asset,error:readError}=await supabase.from("content_assets").select("sku_id,image_authorization_status,compliance_status").eq("id",id).single();if(readError||!asset)throw new Error(readError?.message??"上架资料包不存在");if(decision==="approved"&&(asset.image_authorization_status!=="authorized"&&asset.image_authorization_status!=="self_shot"))throw new Error("图片授权未确认，不能批准上架资料包");if(decision==="approved"&&asset.compliance_status!=="passed")throw new Error("合规检查未通过，不能批准上架资料包");const{error}=await supabase.from("content_assets").update({review_status:decision,status:decision,approved_at:decision==="approved"?new Date().toISOString():null,approved_by:decision==="approved"?user.id:null}).eq("id",id);if(error)throw new Error(error.message);revalidatePath("/content");if(asset.sku_id)revalidatePath(`/skus/${asset.sku_id}`)}
+const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+function traceOf(notes: string | null) { try { return record(JSON.parse(notes ?? "{}")); } catch { return {}; } }
+async function ownedProduct(id: string) {
+  const user = await requireUser(), db = await createClient();
+  const { data, error } = await db.from("candidate_products").select("id,notes").eq("id", id).eq("user_id", user.id).eq("is_demo", false).single();
+  if (error || !data) throw new Error("商品不存在或无权操作");
+  return { db, data };
+}
 
-export async function updateListingChecks(formData:FormData){await requireUser();const supabase=await createClient();const id=String(formData.get("id")??"");const image=String(formData.get("image_authorization_status")??"unverified"),compliance=String(formData.get("compliance_status")??"pending");if(!["unverified","authorized","self_shot","rejected"].includes(image)||!["pending","passed","needs_changes","rejected"].includes(compliance))throw new Error("检查状态无效");const{error}=await supabase.from("content_assets").update({image_authorization_status:image,compliance_status:compliance,review_status:"pending_review",updated_at:new Date().toISOString()}).eq("id",id);if(error)throw new Error(error.message);revalidatePath("/content")}
+export async function saveListingSettings(formData: FormData) {
+  const id = String(formData.get("id") ?? ""), name = String(formData.get("name") ?? "").trim(), category = String(formData.get("category") ?? "").trim();
+  if (!id || !name || !category) throw new Error("商品名称和分类不能为空");
+  const { db, data } = await ownedProduct(id), trace = traceOf(data.notes), now = new Date().toISOString();
+  const { error } = await db.from("candidate_products").update({ name, category, notes: JSON.stringify({ ...trace, listing: { ...record(trace.listing), status: "SETTINGS_SAVED", savedAt: now } }) }).eq("id", id);
+  if (error) throw new Error(error.message);
+  redirect(`/content?product=${encodeURIComponent(id)}&saved=1`);
+}
+
+export async function publishListing(formData: FormData) {
+  const id = String(formData.get("id") ?? "");
+  if (!id) throw new Error("铺货参数无效");
+  const { db, data } = await ownedProduct(id), trace = traceOf(data.notes), listing = record(trace.listing);
+  if (listing.status !== "SETTINGS_SAVED") throw new Error("请先保存铺货设置");
+  const { error } = await db.from("candidate_products").update({ notes: JSON.stringify({ ...trace, listing: { ...listing, status: "LISTED", listedAt: new Date().toISOString(), channel: "TAOBAO" } }) }).eq("id", id);
+  if (error) throw new Error(error.message);
+  redirect(`/content?product=${encodeURIComponent(id)}&completed=1`);
+}

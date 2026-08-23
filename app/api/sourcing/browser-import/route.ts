@@ -17,38 +17,34 @@ const itemSchema = z.object({
 });
 const schema = z.object({
   query: z.string().min(2),
-  keywords: z.array(z.string().min(2)).min(1).max(5),
+  keywords: z.array(z.string().min(1)).min(1),
+  targetOfferCount: z.number().int().min(1).max(500),
   collection: z.object({
-    pagesFetched: z.number().int().min(1).max(15),
+    pagesFetched: z.number().int().min(1).max(1500),
     uniqueCount: z.number().int().min(0),
+    targetOfferCount: z.number().int().min(1).max(500).optional(),
     typeCount: z.number().int().min(0),
-    pageStats: z.array(z.record(z.string(), z.unknown())).max(15),
+    pageStats: z.array(z.record(z.string(), z.unknown())).max(1500),
+    appliedFilters: z.record(z.string(), z.unknown()).optional(),
   }),
-  items: z.array(itemSchema).min(1).max(400),
+  items: z.array(itemSchema).min(1).max(10000),
 });
 
 export async function POST(request: Request) {
   const parsed = schema.safeParse(await request.json().catch(() => null));
   if (!parsed.success) {
-    return Response.json({ error: "采集数据格式无效" }, { status: 400 });
+    const issue = parsed.error.issues[0];
+    return Response.json({
+      error: `采集数据格式无效${issue ? `：${issue.path.join(".") || "请求"} ${issue.message}` : ""}`,
+    }, { status: 400 });
   }
   const db = await createClient();
   const { data: auth } = await db.auth.getUser();
   if (!auth.user) return Response.json({ error: "请先登录" }, { status: 401 });
 
-  const terms = parsed.data.keywords.flatMap((keyword) => {
-    const compact = keyword.replace(/\s+/g, "");
-    return Array.from({ length: Math.max(0, compact.length - 1) }, (_, index) => compact.slice(index, index + 2));
-  });
-  const relevant = parsed.data.items.filter((item) =>
-    terms.some((term) => item.title.includes(term)),
-  );
-  if (!relevant.length) {
-    return Response.json(
-      { error: "当前页商品与搜索词不相关，请确认搜索结果已加载" },
-      { status: 422 },
-    );
-  }
+  // 搜索结果只按 Offer ID 去重；不在导入阶段进行隐藏的标题相关性过滤。
+  // 用户明确选择的 1688 搜索条件已经在扩展端应用，相关性判断仅作为后续决策信息。
+  const collected = parsed.data.items;
 
   const { data: profile } = await db
     .from("store_profiles")
@@ -65,12 +61,15 @@ export async function POST(request: Request) {
     packagingAssumption: Number(profile?.default_packaging_cost ?? .5),
     afterSalesReserve: 0.5,
     platformAndPromotionRate: 0.16,
+    targetOfferCount: parsed.data.targetOfferCount,
+    searchFilters: parsed.data.collection.appliedFilters ?? {},
     pipeline: {
       stage1Status: "COMPLETED",
       stage1Version: 1,
       stage1CompletedAt: new Date().toISOString(),
       stage2Status: "NOT_RUN",
       stage2Version: 0,
+      attributeStatus: "NOT_RUN",
       stage3Status: "NOT_RUN",
     },
   };
@@ -78,7 +77,7 @@ export async function POST(request: Request) {
     (sum, page) => sum + Number(page.found || 0),
     0,
   );
-  const evaluated = evaluateProducts(relevant, {
+  const evaluated = evaluateProducts(collected, {
     minPurchasePrice: criteria.priceRange[0],
     maxPreferredPurchasePrice: criteria.priceRange[1],
     maxPreferredMoq: criteria.maxMoq,
@@ -131,7 +130,7 @@ export async function POST(request: Request) {
     minimum_order_quantity: item.minimumOrderQuantity,
     sales_hint: item.salesHint,
     location: item.location,
-    raw_data: item.rawData || {},
+    raw_data: { ...(item.rawData || {}), searchTitle: item.title },
     data_status: item.dataStatus,
     data_issues: item.dataIssues,
     sales_count: item.salesCount,

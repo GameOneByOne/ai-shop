@@ -26,6 +26,20 @@ export async function POST(request: Request) {
       { error: "没有可重新分析的真实 SourcingRun；请先完成详情采集" },
       { status: 404 },
     );
+  const oldCriteria = (run.criteria ?? {}) as Record<string, unknown>;
+  const pipeline = (oldCriteria.pipeline ?? {}) as Record<string, unknown>;
+  const savedAttributes = oldCriteria.sourcingAttributes as
+    | Record<string, unknown>
+    | undefined;
+  if (
+    pipeline.attributeStatus !== "COMPLETED" ||
+    Number(savedAttributes?.stage2Version ?? -1) !== Number(pipeline.stage2Version ?? 0) ||
+    !savedAttributes?.graph
+  )
+    return Response.json(
+      { error: "请先完成 DeepSeek 商品属性解析" },
+      { status: 409 },
+    );
   const { data: rows, error } = await db
     .from("source_products")
     .select("*")
@@ -68,7 +82,7 @@ export async function POST(request: Request) {
       ? allRows.filter((item) => item.offer_status === "PASS")
       : allRows,
     started = Date.now(),
-    ruleGraph = buildSourcingV3(qualifiedRows, String(run.query ?? "")),
+    ruleGraph = savedAttributes.graph as ReturnType<typeof buildSourcingV3>,
     input = {
       analysis_type: "AI_PRODUCT_MODEL_CLUSTERING_V1",
       prompt_version: "doubao-multimodal-product-model-cluster-v1",
@@ -143,8 +157,6 @@ export async function POST(request: Request) {
     },
     adopted: false,
   });
-  const oldCriteria = (run.criteria ?? {}) as Record<string, unknown>;
-  const pipeline = (oldCriteria.pipeline ?? {}) as Record<string, unknown>;
   const { error: persistError } = await db
     .from("sourcing_runs")
     .update({
