@@ -4,8 +4,10 @@ import { filterOffer } from "@/lib/sourcing/offer-filter";
 import {
   applyAiClusters,
   generateSourcingClusters,
+  type AiModelClusters,
 } from "@/lib/ai/sourcing-cluster";
 export async function POST(request: Request) {
+  if (request.method === "POST") return Response.json({ error: "旧版SKU聚类与素材母版接口已停用；请使用第一阶段 /api/sourcing/ai-selection，铺货后再使用第二阶段 /api/listing/enhance-draft。" }, { status: 410 });
   const db = await createClient(),
     { data: auth } = await db.auth.getUser();
   if (!auth.user) return Response.json({ error: "请先登录" }, { status: 401 });
@@ -31,15 +33,6 @@ export async function POST(request: Request) {
   const savedAttributes = oldCriteria.sourcingAttributes as
     | Record<string, unknown>
     | undefined;
-  if (
-    pipeline.attributeStatus !== "COMPLETED" ||
-    Number(savedAttributes?.stage2Version ?? -1) !== Number(pipeline.stage2Version ?? 0) ||
-    !savedAttributes?.graph
-  )
-    return Response.json(
-      { error: "请先完成 DeepSeek 商品属性解析" },
-      { status: 409 },
-    );
   const { data: rows, error } = await db
     .from("source_products")
     .select("*")
@@ -82,15 +75,18 @@ export async function POST(request: Request) {
       ? allRows.filter((item) => item.offer_status === "PASS")
       : allRows,
     started = Date.now(),
-    ruleGraph = savedAttributes.graph as ReturnType<typeof buildSourcingV3>,
+    ruleGraph = savedAttributes?.graph
+      ? savedAttributes.graph as ReturnType<typeof buildSourcingV3>
+      : buildSourcingV3(qualifiedRows, String(run.query ?? "")),
     input = {
-      analysis_type: "AI_PRODUCT_MODEL_CLUSTERING_V1",
-      prompt_version: "doubao-multimodal-product-model-cluster-v1",
+      analysis_type: "AI_PRODUCT_MATERIAL_MASTER_V1",
+      prompt_version: "single-call-selection-material-master-v1",
       sourcing_run_id: run.id,
       input_references: qualifiedRows.map((x) => x.id),
     };
   const execution = "MULTIMODAL" as const;
   let graph = ruleGraph,
+    materialMasters: AiModelClusters["materialMasters"] = [],
     actualModel = process.env.VISION_MODEL ?? "vision-model-not-configured",
     latencyMs = Date.now() - started,
     inputTokens: number | undefined,
@@ -101,6 +97,7 @@ export async function POST(request: Request) {
       qualifiedRows,
     );
     graph = applyAiClusters(ruleGraph, generated.data);
+    materialMasters = generated.data.materialMasters;
     actualModel = generated.model;
     latencyMs = generated.latencyMs;
     inputTokens = generated.usage.inputTokens;
@@ -123,10 +120,10 @@ export async function POST(request: Request) {
     .from("ai_runs")
     .insert({
       user_id: auth.user.id,
-      type: "AI_PRODUCT_MODEL_CLUSTERING_V1",
+        type: "AI_PRODUCT_MATERIAL_MASTER_V1",
       model: actualModel,
       input_json: { ...input, requested_model: process.env.VISION_MODEL },
-      output_json: { graph, execution, fallbackReason: null },
+      output_json: { graph, materialMasters, execution, fallbackReason: null },
       status: "success",
       latency_ms: latencyMs,
       input_tokens: inputTokens,
@@ -140,7 +137,7 @@ export async function POST(request: Request) {
   await db.from("ai_analyses").insert({
     user_id: auth.user.id,
     ai_run_id: saved.data.id,
-    analysis_type: "AI_PRODUCT_MODEL_CLUSTERING_V1",
+    analysis_type: "AI_PRODUCT_MATERIAL_MASTER_V1",
     result: {
       confidence: graph.sourceSkus.length
         ? Math.round(
@@ -157,6 +154,14 @@ export async function POST(request: Request) {
     },
     adopted: false,
   });
+  const masterByOffer = new Map(materialMasters.map((master) => [master.offerId, master]));
+  const masterUpdates = await Promise.all(qualifiedRows.map((row) => {
+    const master = masterByOffer.get(String(row.id));
+    if (!master) return Promise.resolve({ error: null });
+    return db.from("source_products").update({ raw_data: { ...((row.raw_data ?? {}) as Record<string, unknown>), productMaterialMaster: { ...master, version: 1, analysisRunId: saved.data.id, generatedAt: new Date().toISOString(), model: actualModel } } }).eq("id", row.id).eq("user_id", auth.user!.id);
+  }));
+  const masterUpdateError = masterUpdates.find((result) => result.error)?.error;
+  if (masterUpdateError) return Response.json({ error: `素材母版保存失败：${masterUpdateError.message}` }, { status: 500 });
   const { error: persistError } = await db
     .from("sourcing_runs")
     .update({
@@ -179,6 +184,13 @@ export async function POST(request: Request) {
           analyzedAt: new Date().toISOString(),
           analysisRunId: saved.data.id,
         },
+        productMaterialMasters: {
+          version: 1,
+          generatedAt: new Date().toISOString(),
+          analysisRunId: saved.data.id,
+          model: actualModel,
+          items: materialMasters,
+        },
       },
     })
     .eq("id", run.id);
@@ -191,6 +203,7 @@ export async function POST(request: Request) {
     ok: true,
     analysisRunId: saved.data.id,
     graph,
+    materialMasters,
     meta: {
       execution,
       requestedModel: process.env.VISION_MODEL,

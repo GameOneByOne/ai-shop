@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test:parser": "node tests/browser-extension-parser-rules.test.mjs",
+    "test:two-stage-ai": "node --experimental-strip-types tests/two-stage-ai-contract.test.ts",
     "test:offer-filter": "node --experimental-strip-types tests/offer-filter.test.ts",
     "test:source-products": "node --experimental-strip-types tests/source-products.test.ts"
   },

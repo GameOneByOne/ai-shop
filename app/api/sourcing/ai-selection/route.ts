@@ -1,27 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import { readAiImageCache } from "@/lib/sourcing/ai-image-cache";
+import { sourcingSelectionInputSchema, sourcingSelectionOutputSchema, type SourcingOfferJudgement } from "@/lib/ai/sourcing-selection-contract";
 
-const requestSchema = z.object({ runId: z.string().uuid(), offerIds: z.array(z.string().uuid()).length(1).optional() });
-const judgementSchema = z.object({
-  offerId: z.string().uuid(),
-  recommendation: z.enum(["RECOMMENDED", "USABLE", "CAUTIOUS", "NOT_RECOMMENDED"]), confidence: z.enum(["HIGH", "MEDIUM", "LOW"]),
-  dimensions: z.object({
-    dropshipFit: z.enum(["优秀", "良好", "一般", "存在障碍", "不适配", "待确认"]),
-    supplyStability: z.enum(["优秀", "良好", "一般", "风险", "待确认"]),
-    fulfillmentStability: z.enum(["优秀", "良好", "一般", "风险", "待确认"]),
-    qualityConfidence: z.enum(["优秀", "良好", "一般", "风险", "待确认"]),
-    supplierStability: z.enum(["优秀", "良好", "一般", "风险", "待确认"]),
-  }),
-  directionKey: z.string().trim().min(2).max(80),
-  advantages: z.array(z.string().trim().min(1)).max(8), risks: z.array(z.string().trim().min(1)).max(8),
-  conflicts: z.array(z.string().trim().min(1)).max(8), missingEvidence: z.array(z.string().trim().min(1)).max(8),
-  recommendationReason: z.string().trim().min(2), finalAdvice: z.string().trim().min(2),
-});
-const outputSchema = z.object({ results: z.array(judgementSchema).max(50) });
 const PROMPT_VERSION = "offer-source-evaluation-v1";
-type Judgement = z.infer<typeof judgementSchema>;
+type Judgement = SourcingOfferJudgement;
 
 type Row = Record<string, unknown>;
 const record = (value: unknown): Row =>
@@ -125,7 +108,7 @@ function diversifyRecommendations(results: Judgement[], rows: Row[]) {
 }
 
 export async function POST(request: Request) {
-  const parsed = requestSchema.safeParse(await request.json().catch(() => null));
+  const parsed = sourcingSelectionInputSchema.safeParse(await request.json().catch(() => null));
   if (!parsed.success) return Response.json({ error: "AI选款参数无效" }, { status: 400 });
   const db = await createClient(), { data: auth } = await db.auth.getUser();
   if (!auth.user) return Response.json({ error: "请先登录" }, { status: 401 });
@@ -134,12 +117,10 @@ export async function POST(request: Request) {
   const { data: rows, error } = await db.from("source_products").select("*").eq("sourcing_run_id", run.id).in("data_status", ["valid", "needs_review"]);
   if (error) return Response.json({ error: error.message }, { status: 500 });
   const candidates = ((rows ?? []) as Row[]).filter((row) => {
-    const raw = record(row.raw_data), selection = record(raw.sourcingSelection), ruleDecision = selection.ruleOverride === true ? "PASSED" : String(record(raw.ruleSelection).decision ?? ""), recognition = record(raw.productRecognition);
-    return ruleDecision !== "REJECTED" && ["PASSED", "PENDING", "PRIMARY", "BACKUP"].includes(ruleDecision)
-      && ["offer-product-recognition-v3-category-review", "offer-product-recognition-v4-single", "offer-combined-recognition-evaluation-v1", "offer-combined-recognition-evaluation-v2-selling-name", "offer-combined-recognition-evaluation-v3-standard-selling-title", "offer-combined-recognition-evaluation-v4-evidence-naming"].includes(String(recognition.promptVersion)) && Array.isArray(recognition.productGroups) && recognition.productGroups.length > 0
-      && Array.isArray(recognition.unresolvedSkus) && recognition.unresolvedSkus.length === 0;
+    const raw = record(row.raw_data), selection = record(raw.sourcingSelection), ruleDecision = selection.ruleOverride === true ? "PASSED" : String(record(raw.ruleSelection).decision ?? "");
+    return ruleDecision !== "REJECTED" && ["PASSED", "PENDING", "PRIMARY", "BACKUP"].includes(ruleDecision);
   }).filter((row) => !parsed.data.offerIds || parsed.data.offerIds.includes(String(row.id)));
-  if (!candidates.length) return Response.json({ error: "没有同时满足规则未淘汰、商品识别完成且SKU关系明确的货源" }, { status: 409 });
+  if (!candidates.length) return Response.json({ error: "没有通过规则或待人工确认的候选货源" }, { status: 409 });
   const offers = candidates.map(compactOffer);
   const inputHash = createHash("sha256").update(JSON.stringify({ promptVersion: PROMPT_VERSION, offers: offers.map(({ cachedImageData, ...offer }) => ({ ...offer, hasPreparedImage: Boolean(cachedImageData) })) })).digest("hex");
   const criteria = record(run.criteria), previous = record(criteria.offerAiSelection);
@@ -166,7 +147,7 @@ export async function POST(request: Request) {
   if (!response.ok) return Response.json({ error: body.error?.message ?? `AI选款请求失败 (${response.status})` }, { status: 502 });
   let value: unknown;
   try { value = JSON.parse(body.choices?.[0]?.message?.content ?? ""); } catch { return Response.json({ error: "AI选款未返回合法JSON" }, { status: 502 }); }
-  const output = outputSchema.safeParse(value);
+  const output = sourcingSelectionOutputSchema.safeParse(value);
   if (!output.success) return Response.json({ error: "AI选款结果格式不完整", details: output.error.flatten() }, { status: 502 });
   const expected = new Set(candidates.map((row) => String(row.id))), diversifiedResults = diversifyRecommendations(output.data.results, candidates), byId = new Map(diversifiedResults.filter((item) => expected.has(item.offerId)).map((item) => [item.offerId, item]));
   if (byId.size !== expected.size) return Response.json({ error: `AI选款仅返回 ${byId.size}/${expected.size} 个商品，请重试` }, { status: 502 });

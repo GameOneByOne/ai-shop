@@ -37,6 +37,26 @@ const clusterSchema = z.object({
       }),
     }),
   ),
+  materialMasters: z.array(z.object({
+    offerId: z.string().min(1),
+    title: z.string().min(1).max(30),
+    guideTitle: z.string().max(30),
+    sellingPoints: z.array(z.string().min(1).max(40)).length(5),
+    shortDescription: z.string().min(1).max(120),
+    detailSections: z.array(z.object({ heading: z.string().min(1).max(20), body: z.string().min(1).max(500), evidence: z.array(z.string()) })).min(5).max(10),
+    verifiedAttributes: z.array(z.object({ name: z.string().min(1), value: z.string().min(1), evidence: z.string().min(1) })),
+    skuContent: z.array(z.object({ sourceSkuId: z.string().min(1), optimizedName: z.string().min(1).max(60), attributes: z.record(z.string(), z.string()), merchantCode: z.string().min(1).max(64) })),
+    mediaPlan: z.object({
+      squareMainImageUrls: z.array(z.string().url()).max(5),
+      verticalMainImageUrls: z.array(z.string().url()).max(5),
+      whiteBackgroundSourceUrl: z.string().url().nullable(),
+      detailImageUrls: z.array(z.string().url()).max(30),
+      videoUrls: z.array(z.string().url()).max(5),
+    }),
+    factGaps: z.array(z.string()),
+    rejectedClaims: z.array(z.string()),
+    confidence: z.number().min(0).max(1),
+  })),
 });
 
 interface ChatResponse {
@@ -82,9 +102,23 @@ export async function generateSourcingClusters(
   > = [
     {
       type: "text",
-      text: '只能从下面提供的商品名、SourceSKU和图片中提取直接可见或明确写出的事实，禁止补充常识、推测、联想、改写成营销卖点或虚构任何信息。基于这些材料聚类商品款型。规格依据的优先级为SourceSKU文字、商品名文字、图片：文字中已明确写出的规格必须采用文字值；图片只补充文字未表达的规格；图片与文字冲突时必须采用文字值并标记对应文字来源。款型总体描述只能汇总材料中已确认的共同事实。每条商品规格必须标明依据来自“商品名”“SourceSKU”或“图片”；无法直接确认的规格必须省略。只输出JSON：{"models":[{"name":"款型名称","description":"仅含已确认事实的款型总体描述","sourceSkuIds":["sourceSkuId"]}],"skuAttributes":[{"sourceSkuId":"sourceSkuId","specifications":[{"name":"规格名","value":"规格值","basis":"SourceSKU"}],"color":null,"size":null,"dimensions":{}}]}。dimensions可包含length_cm、diameter_cm、width_cm、height_cm、thickness_cm；无法确认的字段不要输出。',
+      text: '你是AI选品与淘宝素材母版模型，本次是该商品唯一一次模型调用。只能从提供的商品名、SourceSKU、结构化事实、图片和视频地址中提取直接可见或明确写出的事实，禁止补充常识、推测或虚构品牌、材质、尺寸、功效、认证、库存、售后。一次完成款型聚类、SKU属性解析，并为每个Offer生成后续内容制作可直接复用的materialMaster。标题和导购标题不超过30字；每个标题特征必须有输入证据。mediaPlan只能引用对应Offer输入中真实存在的URL，不生成文件。skuContent必须逐条覆盖该Offer全部sourceSkuId，merchantCode使用稳定SourceSKU标识且不超过64字符。缺失信息写factGaps，风险宣传写rejectedClaims。规格依据优先级为SourceSKU文字、商品名文字、图片；冲突时采用文字并标明来源。只输出JSON：{"models":[{"name":"款型名称","description":"已确认事实","sourceSkuIds":["sourceSkuId"]}],"skuAttributes":[{"sourceSkuId":"sourceSkuId","specifications":[{"name":"规格名","value":"规格值","basis":"SourceSKU|商品名|图片"}],"color":null,"size":null,"dimensions":{}}],"materialMasters":[{"offerId":"offerId","title":"淘宝标题","guideTitle":"导购标题","sellingPoints":["卖点1","卖点2","卖点3","卖点4","卖点5"],"shortDescription":"短描述","detailSections":[{"heading":"标题","body":"正文","evidence":["证据"]}],"verifiedAttributes":[{"name":"属性","value":"值","evidence":"证据"}],"skuContent":[{"sourceSkuId":"原ID","optimizedName":"规格名","attributes":{},"merchantCode":"稳定编码"}],"mediaPlan":{"squareMainImageUrls":[],"verticalMainImageUrls":[],"whiteBackgroundSourceUrl":null,"detailImageUrls":[],"videoUrls":[]},"factGaps":[],"rejectedClaims":[],"confidence":0.8}]}。dimensions仅可包含length_cm、diameter_cm、width_cm、height_cm、thickness_cm；无法确认则省略。',
     },
   ];
+  const addedMedia = new Set<string>();
+  for (const row of rows) {
+    const raw = (row.raw_data ?? {}) as Record<string, unknown>;
+    const detail = (raw.detailEnrichment ?? {}) as Record<string, unknown>;
+    const urls = [row.image_url, ...(Array.isArray(detail.mainImages) ? detail.mainImages : []), ...(Array.isArray(detail.detailImages) ? detail.detailImages : [])]
+      .filter((value): value is string => typeof value === "string" && /^https?:/i.test(value));
+    const videoUrls = [detail.videoUrl, ...(Array.isArray(detail.videoUrls) ? detail.videoUrls : [])].filter((value): value is string => typeof value === "string" && /^https?:/i.test(value));
+    content.push({ type: "text", text: `Offer素材事实：${JSON.stringify({ offerId: row.id, title: row.title, attributes: detail.productAttributes ?? {}, imageUrls: urls, videoUrls })}` });
+    for (const url of urls.slice(0, 5)) {
+      if (addedMedia.size >= 20 || addedMedia.has(url)) continue;
+      addedMedia.add(url);
+      content.push({ type: "image_url", image_url: { url, detail: "low" } });
+    }
+  }
   for (const [image, skus] of groupedByImage) {
     content.push({ type: "text", text: skus.map(itemText).join("\n\n") });
     content.push({

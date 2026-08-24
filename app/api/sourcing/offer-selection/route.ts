@@ -73,6 +73,7 @@ export async function POST(request: Request) {
         blindShipping: booleanValue(facts.blindShipping),
         returnShipping: booleanValue(facts.returnShipping),
       },
+      productMaterialMaster: record(raw.productMaterialMaster),
       selectedAt,
     };
     const marker = `"sourceOfferId":"${offer.id}"`;

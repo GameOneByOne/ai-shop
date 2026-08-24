@@ -89,13 +89,13 @@ function fixedTitleBadgeFacts(pageTitle) {
   const titleNode = [...document.querySelectorAll("h1,[class*=offer-title],[class*=product-title]")]
     .find((node) => cleanText(node.innerText || node.textContent).includes(pageTitle || ""));
   if (!titleNode) return { hasSelectionTitle: null, selectionTitle: null };
-  let module = titleNode;
-  for (let depth = 0; module.parentElement && depth < 4; depth += 1) {
-    const next = module.parentElement, text = cleanText(next.innerText);
+  let titleModule = titleNode;
+  for (let depth = 0; titleModule.parentElement && depth < 4; depth += 1) {
+    const next = titleModule.parentElement, text = cleanText(next.innerText);
     if (text.length > 1800 || next.getBoundingClientRect().height > 600) break;
-    module = next;
+    titleModule = next;
   }
-  const ownLabels = [...module.querySelectorAll("span,img,[title],[aria-label]")]
+  const ownLabels = [...titleModule.querySelectorAll("span,img,[title],[aria-label]")]
     .flatMap((node) => [node.innerText, node.getAttribute("alt"), node.getAttribute("title"), node.getAttribute("aria-label")])
     .map(cleanText).filter(Boolean),
     selectionTitle = ownLabels.find((value) => /^(?:1688)?严选$/.test(value)) || null;
@@ -303,6 +303,99 @@ async function extractMaterialPreviewTitle() {
 
 function reportReviewParseStatus(status) {
   try { chrome.runtime.sendMessage({ type: "DETAIL_REVIEW_STATUS", status }); } catch {}
+}
+
+function visiblePublishControl(pattern, root = document) {
+  return [...root.querySelectorAll("button,a,[role=button],label")].find((node) => {
+    const rect = node.getBoundingClientRect(), text = cleanText(node.innerText || node.textContent);
+    return rect.width > 0 && rect.height > 0 && pattern.test(text);
+  });
+}
+
+async function startDefaultPublish() {
+  const stages = [];
+  const publishEntries = [...document.querySelectorAll("button,a,[role=button]")].filter((node) => {
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && cleanText(node.innerText || node.textContent) === "立即铺货";
+  });
+  const entry = publishEntries.find((node) => {
+    let parent = node.parentElement;
+    for (let depth = 0; parent && depth < 8; depth += 1, parent = parent.parentElement) {
+      const text = cleanText(parent.innerText);
+      if (/密文代发|分销代发|铺货素材/.test(text)) return true;
+      if (text.length > 12000) break;
+    }
+    return false;
+  }) || (publishEntries.length === 1 ? publishEntries[0] : null);
+  if (!entry) throw new Error("找不到“立即铺货”按钮，请确认当前是支持铺货的 1688 商品详情页");
+  entry.click();
+  stages.push("clicked_immediate_publish");
+
+  const containingPanel = (anchor) => {
+    let node = anchor;
+    for (let depth = 0; node && depth < 12; depth += 1, node = node.parentElement) {
+      const rect = node.getBoundingClientRect(), text = cleanText(node.innerText);
+      const hasStoreSelector = node.querySelector?.('input[type="checkbox"],[role="checkbox"]');
+      if (rect.width > 240 && rect.height > 100 && rect.right > innerWidth * 0.7 && text.length < 30000 && /确认店铺/.test(text) && (hasStoreSelector || /立即铺货/.test(text))) return node;
+    }
+    return null;
+  };
+  let panel = null;
+  for (let attempt = 0; attempt < 20 && !panel; attempt += 1) {
+    await wait(250);
+    panel = [...document.querySelectorAll('[role="dialog"],.next-dialog,.next-overlay-wrapper,.ant-modal,.ant-drawer,.ant-drawer-content-wrapper')].find((node) => {
+      const rect = node.getBoundingClientRect(), text = cleanText(node.innerText);
+      return rect.width > 0 && rect.height > 0 && /确认店铺/.test(text);
+    }) || null;
+    if (!panel) {
+      const confirmAnchor = visiblePublishControl(/^立即铺货$/);
+      panel = confirmAnchor ? containingPanel(confirmAnchor) : null;
+    }
+    if (!panel) {
+      const titleAnchor = [...document.querySelectorAll("div,span,h1,h2,h3,h4")].find((node) => {
+        const rect = node.getBoundingClientRect(), text = cleanText(node.textContent);
+        return rect.width > 0 && rect.height > 0 && text === "确认店铺";
+      });
+      panel = titleAnchor ? containingPanel(titleAnchor) : null;
+    }
+  }
+  if (!panel) return { ok: true, stages, needsFrameConfirmation: true };
+
+  const nativeChecks = [...panel.querySelectorAll('input[type="checkbox"]')].filter((input) => !input.disabled);
+  const semanticChecks = [...panel.querySelectorAll('[role="checkbox"]')].filter((node) => node.getAttribute("aria-disabled") !== "true");
+  const uncheckedNative = nativeChecks.find((input) => !input.checked && /淘宝|店铺|铺货/.test(cleanText(input.closest("label")?.innerText || input.parentElement?.parentElement?.innerText || panel.innerText)));
+  const uncheckedSemantic = semanticChecks.find((node) => node.getAttribute("aria-checked") !== "true" && /淘宝|店铺|铺货/.test(cleanText(node.closest("label")?.innerText || node.parentElement?.parentElement?.innerText || panel.innerText)));
+  const storeSelected = () => [...panel.querySelectorAll('input[type="checkbox"]')].some((input) => input.checked || input.closest(".ant-checkbox")?.classList.contains("ant-checkbox-checked")) || [...panel.querySelectorAll('[role="checkbox"]')].some((node) => node.getAttribute("aria-checked") === "true");
+  if (uncheckedNative) {
+    for (let attempt = 0; attempt < 3 && !storeSelected(); attempt += 1) {
+      const currentCheckbox = [...panel.querySelectorAll('input[type="checkbox"]')].find((input) => !input.disabled && !input.checked);
+      if (!currentCheckbox) break;
+      currentCheckbox.focus();
+      currentCheckbox.click();
+      await wait(350);
+    }
+  } else if (uncheckedSemantic) {
+    for (let attempt = 0; attempt < 3 && !storeSelected(); attempt += 1) {
+      const currentCheckbox = [...panel.querySelectorAll('[role="checkbox"]')].find((node) => node.getAttribute("aria-disabled") !== "true" && node.getAttribute("aria-checked") !== "true");
+      if (!currentCheckbox) break;
+      currentCheckbox.focus();
+      currentCheckbox.click();
+      await wait(350);
+    }
+  }
+  else if (!nativeChecks.some((input) => input.checked) && !semanticChecks.some((node) => node.getAttribute("aria-checked") === "true"))
+    throw new Error("“确认店铺”抽屉中未找到可勾选的淘宝店铺");
+  for (let attempt = 0; attempt < 20 && !storeSelected(); attempt += 1) await wait(250);
+  if (!storeSelected()) throw new Error("已找到淘宝店铺，但自动勾选未生效");
+  stages.push("checked_default_store");
+
+  const confirm = visiblePublishControl(/^立即铺货$/, panel);
+  if (!confirm) throw new Error("“确认店铺”抽屉中找不到底部“立即铺货”按钮");
+  for (let attempt = 0; attempt < 20 && (confirm.disabled || confirm.getAttribute("aria-disabled") === "true"); attempt += 1) await wait(250);
+  if (confirm.disabled || confirm.getAttribute("aria-disabled") === "true") throw new Error("店铺已勾选，但底部“立即铺货”按钮仍未启用");
+  confirm.click();
+  stages.push("confirmed_publish");
+  return { ok: true, stages, submittedAt: new Date().toISOString(), currentUrl: location.href };
 }
 
 function emptyProductReviewFacts(status) {
@@ -1810,6 +1903,12 @@ async function extractDetails(source, factsOnly = false) {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === "START_DEFAULT_PUBLISH") {
+    void startDefaultPublish()
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ error: error instanceof Error ? error.message : "默认模板铺货失败" }));
+    return true;
+  }
   if (message?.type === "READ_KEYWORD") {
     const fromInput = searchInput()?.value?.trim() || "",
       fromUrl = decode1688Keyword();

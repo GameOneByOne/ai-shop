@@ -2,20 +2,25 @@ import { requireUser } from "@/lib/data/auth";
 import { createClient } from "@/lib/supabase/server";
 import { SourcingTaskIndex } from "@/components/sourcing/sourcing-task-index";
 
-export default async function Page() {
+const PAGE_SIZE = 10;
+
+export default async function Page({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
   const user = await requireUser();
   const db = await createClient();
-  const { data, error } = await db
+  const query = await searchParams;
+  const requestedPage = typeof query.page === "string" ? Number.parseInt(query.page, 10) : 1;
+  const currentPage = Number.isFinite(requestedPage) && requestedPage > 0 ? requestedPage : 1;
+  const from = (currentPage - 1) * PAGE_SIZE;
+  const { data, error, count } = await db
     .from("sourcing_runs")
-    .select(
-      "id,query,status,fetched_count,eligible_count,created_at,completed_at,criteria",
-    )
+    .select("id,query,status,fetched_count,eligible_count,created_at,completed_at,criteria", { count: "exact" })
     .eq("user_id", user.id)
     .eq("provider", "1688-browser")
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .range(from, from + PAGE_SIZE - 1);
   const runIds = (data ?? []).map((run) => run.id);
   const { data: products } = runIds.length
-    ? await db.from("source_products").select("*").in("sourcing_run_id", runIds)
+    ? await db.from("source_products").select("id,sourcing_run_id,offer_facts_captured_at,raw_data").in("sourcing_run_id", runIds)
     : { data: [] };
   const runs = (data ?? []).map((run) => {
     const rows = (products ?? []).filter(
@@ -67,6 +72,9 @@ export default async function Page() {
     <SourcingTaskIndex
       runs={runs}
       error={error?.message ?? null}
+      currentPage={currentPage}
+      totalPages={Math.max(1, Math.ceil((count ?? 0) / PAGE_SIZE))}
+      totalCount={count ?? 0}
     />
   );
 }

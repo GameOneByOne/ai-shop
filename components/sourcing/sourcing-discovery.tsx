@@ -596,19 +596,19 @@ export function SourcingDiscovery({
   async function runAiSelectionDirections() {
     setClustering(true);
     setError("");
-    setProgress("正在发送低分辨率商品图片并进行多模态款型聚类…");
+    setProgress("AI正在一次评估全部候选货源；本阶段不生成上架内容…");
     try {
-      const analyzeResponse = await fetch("/api/sourcing/v3/analyze", {
+      const analyzeResponse = await fetch("/api/sourcing/ai-selection", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ runId }),
       });
       const analyzeBody = await analyzeResponse.json();
       if (!analyzeResponse.ok)
-        throw new Error(analyzeBody.error ?? "商品款型聚类失败");
+        throw new Error(analyzeBody.error ?? "AI货源选择失败");
       await loadLatest();
       await onDataChange?.();
-      setProgress("多模态商品款型聚类已完成，货源工作区已刷新。");
+      setProgress("第一阶段AI货源选择完成。上架内容将在铺货后读取淘宝草稿再增强。");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "AI 选款方向失败");
       setProgress("");
@@ -783,22 +783,9 @@ export function SourcingDiscovery({
               pipeline?.stage2Status !== "COMPLETED" ||
               !stats?.sourceSkus
             }
-            onClick={() => void runAttributeParsing()}
-          >
-            {parsingAttributes ? "正在解析商品属性…" : "DeepSeek解析商品属性"}
-          </button>}
-          {!compact && <button
-            className="secondary-btn"
-            disabled={
-              Boolean(busy) ||
-              parsingAttributes ||
-              clustering ||
-              pipeline?.attributeStatus !== "COMPLETED" ||
-              !stats?.sourceSkus
-            }
             onClick={() => void runAiSelectionDirections()}
           >
-            {clustering ? "正在生成选款方向…" : "AI选款方向"}
+            {clustering ? "正在评估候选货源…" : "AI选择货源"}
           </button>}
         </div>
 

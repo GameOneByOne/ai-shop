@@ -54,9 +54,15 @@ function resultSummary(run: Run) {
 export function SourcingTaskIndex({
   runs,
   error,
+  currentPage,
+  totalPages,
+  totalCount,
 }: {
   runs: Run[];
   error: string | null;
+  currentPage: number;
+  totalPages: number;
+  totalCount: number;
 }) {
   return (
     <div className="v2-page sourcing-task-index">
@@ -64,7 +70,7 @@ export function SourcingTaskIndex({
       <header className="v2-page-head">
         <div>
           <h1>货源任务</h1>
-          <p>搜索真实 1688 Offer，完成解析、规则初筛、AI分析与货源选择。</p>
+          <p>搜索真实 1688 Offer，完成规则筛选和第一阶段 AI 货源选择。上架内容在铺货后基于淘宝草稿增强。共 {totalCount} 个任务。</p>
         </div>
         <Link
           className="v2-primary"
@@ -105,6 +111,11 @@ export function SourcingTaskIndex({
           </div>
         )}
       </section>
+      {totalPages > 1 && <nav className="sourcing-pagination" aria-label="货源任务分页">
+        <Link className={`v2-secondary${currentPage <= 1 ? " disabled" : ""}`} aria-disabled={currentPage <= 1} href={currentPage <= 1 ? `/products/discover?page=1` : `/products/discover?page=${currentPage - 1}`}>上一页</Link>
+        <span>第 {Math.min(currentPage, totalPages)} / {totalPages} 页</span>
+        <Link className={`v2-secondary${currentPage >= totalPages ? " disabled" : ""}`} aria-disabled={currentPage >= totalPages} href={currentPage >= totalPages ? `/products/discover?page=${totalPages}` : `/products/discover?page=${currentPage + 1}`}>下一页</Link>
+      </nav>}
     </div>
   );
 }

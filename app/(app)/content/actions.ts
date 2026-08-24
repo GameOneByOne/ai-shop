@@ -12,13 +12,15 @@ async function ownedProduct(id: string) {
   return { db, data };
 }
 
-export async function saveListingSettings(formData: FormData) {
-  const id = String(formData.get("id") ?? ""), name = String(formData.get("name") ?? "").trim(), category = String(formData.get("category") ?? "").trim();
-  if (!id || !name || !category) throw new Error("商品名称和分类不能为空");
-  const { db, data } = await ownedProduct(id), trace = traceOf(data.notes), now = new Date().toISOString();
-  const { error } = await db.from("candidate_products").update({ name, category, notes: JSON.stringify({ ...trace, listing: { ...record(trace.listing), status: "SETTINGS_SAVED", name, category, settingsSource: "USER", savedAt: now } }) }).eq("id", id);
+export async function startDefaultListingTask(formData: FormData) {
+  const id = String(formData.get("id") ?? "");
+  if (!id) throw new Error("商品参数无效");
+  const { db, data } = await ownedProduct(id), trace = traceOf(data.notes);
+  const sourceUrl = typeof trace.sourceUrl === "string" ? trace.sourceUrl : "";
+  if (!/^https:\/\/(?:[^/]+\.)?1688\.com\//i.test(sourceUrl)) throw new Error("未找到有效的 1688 货源地址");
+  const { error } = await db.from("candidate_products").update({ notes: JSON.stringify({ ...trace, listing: { ...record(trace.listing), status: "PUBLISHING", mode: "DEFAULT_TEMPLATE_UNCHANGED", startedAt: new Date().toISOString() } }) }).eq("id", id);
   if (error) throw new Error(error.message);
-  redirect(`/content?product=${encodeURIComponent(id)}&saved=1`);
+  redirect(sourceUrl);
 }
 
 function taobaoReference(value: string) {
@@ -32,7 +34,7 @@ export async function confirmPublishedListing(formData: FormData) {
   if (!id || !reference) throw new Error("请填写发布成功后的淘宝商品链接或商品ID");
   const { db, data } = await ownedProduct(id), trace = traceOf(data.notes), listing = record(trace.listing);
   const legacyUnverified = listing.status === "LISTED" && !listing.taobaoItemId;
-  if (listing.status !== "SETTINGS_SAVED" && !legacyUnverified) throw new Error("请先保存铺货设置");
+  if (!["PUBLISHING", "SETTINGS_SAVED"].includes(String(listing.status)) && !legacyUnverified) throw new Error("请先开始铺货任务");
   const { error } = await db.from("candidate_products").update({ notes: JSON.stringify({ ...trace, listing: { ...listing, status: "LISTED", listedAt: new Date().toISOString(), channel: "TAOBAO", taobaoItemId: reference.itemId, taobaoItemUrl: reference.itemUrl } }) }).eq("id", id);
   if (error) throw new Error(error.message);
   redirect(`/content?product=${encodeURIComponent(id)}&completed=1`);
