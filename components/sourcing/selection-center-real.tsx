@@ -188,6 +188,8 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
     [recognizingProducts, setRecognizingProducts] = useState(false),
     [message, setMessage] = useState(""),
     [aiProgress, setAiProgress] = useState({ completed: 0, total: 0 }),
+    [aiLastRunFailed, setAiLastRunFailed] = useState(false),
+    [aiLastRunSucceeded, setAiLastRunSucceeded] = useState(false),
     [operationClock, setOperationClock] = useState<{ phase: "RULE" | "AI" | "ENRICH"; startedAt: number; endedAt?: number } | null>(null),
     [clockNow, setClockNow] = useState(0);
   useEffect(() => {
@@ -249,7 +251,7 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
   const productRecognitionComplete = recognitionCandidates.length > 0 && recognitionCandidates.every((offer) => {
     const recognition = rawRecord(offer.raw_data.productRecognition), detail = rawRecord(offer.raw_data.detailEnrichment);
     const analyzedAt = Date.parse(String(recognition.analyzedAt ?? "")), detailCapturedAt = Date.parse(String(detail.capturedAt ?? ""));
-    return recognition.promptVersion === "offer-combined-recognition-evaluation-v3-standard-selling-title" && Array.isArray(recognition.productGroups) && recognition.productGroups.length > 0 && (!Number.isFinite(detailCapturedAt) || (Number.isFinite(analyzedAt) && analyzedAt >= detailCapturedAt));
+    return recognition.promptVersion === "offer-combined-recognition-evaluation-v4-evidence-naming" && Array.isArray(recognition.productGroups) && recognition.productGroups.length > 0 && (!Number.isFinite(detailCapturedAt) || (Number.isFinite(analyzedAt) && analyzedAt >= detailCapturedAt));
   });
   const headerRulePassed = offers.filter((offer) => ruleDecisionOf(offer) === "PASSED").length;
   const headerAiRecommended = offers.filter((offer) => offerAiSelection(offer)?.recommendation === "RECOMMENDED").length;
@@ -257,12 +259,13 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
   const detailedOffers = offers.filter((offer) => Boolean(offer.raw_data.detailEnrichment)).length;
   const messageTone = /失败|错误|超时/.test(message) ? "error" : /淘汰|缺失|严格/.test(message) ? "warning" : "success";
   const elapsedSeconds = operationClock ? Math.max(0, Math.floor(((operationClock.endedAt ?? clockNow) - operationClock.startedAt) / 1000)) : 0;
-  const activePhaseLabel = operationClock?.phase === "RULE" ? "规则初筛" : operationClock?.phase === "AI" ? "AI分析" : operationClock?.phase === "ENRICH" ? "补齐数据" : "";
+  const activePhaseLabel = ruleSelecting ? "规则初筛" : recognizingProducts ? "AI分析" : rechecking ? "补齐数据" : "";
+  const aiStageComplete = (aiSelectionComplete && productRecognitionComplete) || aiLastRunSucceeded;
   const pipelineSteps = [
     { label: "搜索货源", done: offers.length > 0, active: false, detail: offers.length ? `${offers.length} 条` : "待运行" },
     { label: "解析详情", done: offers.length > 0 && detailedOffers === offers.length, active: operationClock?.phase === "ENRICH" && !operationClock.endedAt, detail: `${detailedOffers}/${offers.length}` },
     { label: "规则初筛", done: offers.some((offer) => Boolean(ruleSelectionOf(offer).screenedAt)), active: ruleSelecting, detail: ruleSelecting ? "运行中" : `${headerRulePassed} 条通过` },
-    { label: "AI分析", done: aiSelectionComplete && productRecognitionComplete, active: recognizingProducts, detail: recognizingProducts ? `${aiProgress.completed}/${aiProgress.total}` : aiSelectionComplete && productRecognitionComplete ? `${recognitionCandidates.length} 条完成` : aiAnalyzedCount ? `需重新分析 ${recognitionCandidates.length} 条` : "待运行" },
+    { label: "AI分析", done: aiStageComplete, active: recognizingProducts, detail: recognizingProducts ? `${aiProgress.completed}/${aiProgress.total}` : aiStageComplete ? `${recognitionCandidates.length} 条完成` : aiAnalyzedCount ? `需重新分析 ${recognitionCandidates.length} 条` : "待运行" },
   ];
   const supplierCount = new Set(
     offers.map((offer) => offer.supplier_name).filter(Boolean),
@@ -356,7 +359,7 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
   }
   async function runProductRecognition() {
     if (!data?.runId || recognizingProducts) return;
-    setRecognizingProducts(true); setAiProgress({ completed: 0, total: recognitionCandidates.length }); setOperationClock({ phase: "AI", startedAt: Date.now() }); setMessage("正在逐条识别分类与评估货源…");
+    setRecognizingProducts(true); setAiLastRunFailed(false); setAiLastRunSucceeded(false); setAiProgress({ completed: 0, total: recognitionCandidates.length }); setOperationClock({ phase: "AI", startedAt: Date.now() }); setMessage("正在逐条识别分类与评估货源…");
     try {
       const ids = recognitionCandidates.map((offer) => offer.id);
       setMessage(`正在准备 ${ids.length} 个未淘汰货源的分析主图…`);
@@ -389,8 +392,10 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
         setAiProgress({ completed: index + 1, total: batches.length });
       }
       await refreshData();
+      setAiLastRunFailed(failures.length > 0);
+      setAiLastRunSucceeded(failures.length === 0 && processed === ids.length);
       setMessage(failures.length ? `AI逐条判断完成：成功 ${processed} 条，失败 ${failures.length} 条；${failures.slice(0, 3).join("；")}` : `AI逐条判断完成，共处理 ${processed} 个候选货源。`);
-    } catch (error) { setMessage(error instanceof Error ? error.message : "AI商品识别失败"); }
+    } catch (error) { setAiLastRunFailed(true); setAiLastRunSucceeded(false); setMessage(error instanceof Error ? error.message : "AI商品识别失败"); }
     finally { setRecognizingProducts(false); setOperationClock((current) => current?.phase === "AI" ? { ...current, endedAt: Date.now() } : current); }
   }
   async function retryFailedOfferDetails() {
@@ -491,10 +496,10 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
           </div>
         </header>
         <section className="sourcing-pipeline-progress" aria-label="货源处理进度">
-          <div className="pipeline-progress-head"><div><b>{activePhaseLabel ? `正在${activePhaseLabel}` : pipelineSteps.every((step) => step.done) ? "本轮处理已完成" : "货源处理进度"}</b><span>{operationClock ? `${operationClock.endedAt ? "本次耗时" : "已运行"} ${formatDuration(elapsedSeconds)}` : "按阶段推进并保留结果"}</span></div><strong>{pipelineSteps.filter((step) => step.done).length} / {pipelineSteps.length}</strong></div>
+          <div className="pipeline-progress-head"><div><b>{activePhaseLabel ? `正在${activePhaseLabel}` : operationClock?.phase === "AI" && aiLastRunFailed ? "本次AI重跑失败，已保留上次结果" : pipelineSteps.every((step) => step.done) ? "本轮处理已完成" : "货源处理进度"}</b><span>{operationClock ? `${operationClock.endedAt ? "本次耗时" : "已运行"} ${formatDuration(elapsedSeconds)}` : "按阶段推进并保留结果"}</span></div><strong>{pipelineSteps.filter((step) => step.done).length} / {pipelineSteps.length}</strong></div>
           <div className="pipeline-step-track">{pipelineSteps.map((step, index) => <div key={step.label} className={`${step.done ? "done" : ""}${step.active ? " active" : ""}`}><i>{step.done ? "✓" : index + 1}</i><span><b>{step.label}</b><small>{step.detail}</small></span></div>)}</div>
         </section>
-        {productRecognitionComplete && aiSelectionComplete && <div className="ai-run-summary"><div><b>AI分析完成</b><span>已处理 {aiAnalyzedCount} 条 · 推荐 {headerAiRecommended} · 可用 {offers.filter((offer) => offerAiSelection(offer)?.recommendation === "USABLE").length} · 谨慎 {offers.filter((offer) => offerAiSelection(offer)?.recommendation === "CAUTIOUS").length}</span></div><button type="button" onClick={() => void runProductRecognition()}>重新运行</button></div>}
+        {aiStageComplete && <div className={`ai-run-summary${aiLastRunFailed ? " stale" : ""}`}><div><b>{aiLastRunFailed ? "已保留上次AI结果" : "AI分析完成"}</b><span>已处理 {aiLastRunSucceeded ? recognitionCandidates.length : aiAnalyzedCount} 条 · 推荐 {headerAiRecommended} · 可用 {offers.filter((offer) => offerAiSelection(offer)?.recommendation === "USABLE").length} · 谨慎 {offers.filter((offer) => offerAiSelection(offer)?.recommendation === "CAUTIOUS").length}</span></div><button type="button" onClick={() => void runProductRecognition()}>重新运行</button></div>}
         {message && <div className={`status-box ${messageTone}`}>{message}</div>}
         {!data && !message ? (
           <div className="status-box">正在加载本轮货源…</div>
@@ -1138,7 +1143,7 @@ function offerAiSelection(offer: Offer): OfferAiSelection | null {
 }
 function productRecognitionOf(offer: Offer): ProductRecognition | null {
   const value = rawRecord(offer.raw_data.productRecognition);
-  return ["offer-combined-recognition-evaluation-v1", "offer-combined-recognition-evaluation-v2-selling-name", "offer-combined-recognition-evaluation-v3-standard-selling-title"].includes(String(value.promptVersion)) && Array.isArray(value.productGroups) && value.productGroups.length > 0 && value.productName && value.categoryChild ? value as unknown as ProductRecognition : null;
+  return ["offer-combined-recognition-evaluation-v1", "offer-combined-recognition-evaluation-v2-selling-name", "offer-combined-recognition-evaluation-v3-standard-selling-title", "offer-combined-recognition-evaluation-v4-evidence-naming"].includes(String(value.promptVersion)) && Array.isArray(value.productGroups) && value.productGroups.length > 0 && value.productName && value.categoryChild ? value as unknown as ProductRecognition : null;
 }
 function aiRecommendationLabel(value: OfferAiSelection["recommendation"]) {
   return value === "RECOMMENDED" ? "推荐" : value === "USABLE" ? "可用" : value === "CAUTIOUS" ? "谨慎" : "不推荐";

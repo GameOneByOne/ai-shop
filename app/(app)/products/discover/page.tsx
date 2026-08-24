@@ -34,7 +34,7 @@ export default async function Page() {
       const aiEligible = ruleDecision === "PASSED" && selection.status !== "REJECTED";
       const analyzedAt = Date.parse(String(recognition.analyzedAt ?? ""));
       const detailAt = Date.parse(String(detail.capturedAt ?? ""));
-      const aiCurrent = recognition.promptVersion === "offer-combined-recognition-evaluation-v3-standard-selling-title"
+      const aiCurrent = recognition.promptVersion === "offer-combined-recognition-evaluation-v4-evidence-naming"
         && Array.isArray(recognition.productGroups)
         && recognition.productGroups.length > 0
         && Boolean(ai.recommendation)

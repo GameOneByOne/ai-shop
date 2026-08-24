@@ -5,7 +5,7 @@ import { downloadAiImage, readAiImageCache } from "@/lib/sourcing/ai-image-cache
 
 export const maxDuration = 180;
 
-const requestSchema = z.object({ runId: z.string().uuid(), offerIds: z.array(z.string().uuid()).length(1) });
+const requestSchema = z.object({ runId: z.string().uuid(), offerIds: z.array(z.string().uuid()).length(1), maxTitleChars: z.number().int().min(20).max(120).default(60) });
 const categories = {
   玩具互动: ["猫隧道", "逗猫棒", "自嗨玩具", "益智玩具", "猫薄荷木天蓼", "其他互动玩具"],
   抓挠攀爬: ["猫抓板", "猫抓柱", "猫爬架", "抓窝一体"],
@@ -23,6 +23,10 @@ const resultSchema = z.object({ results: z.array(z.object({
   offerType: z.enum(["SINGLE_PRODUCT", "MIXED_SKU"]),
   productGroups: z.array(z.object({
     standardName: z.string().trim().min(2).max(80), sellingTitle: z.string().trim().min(8).max(120), categoryParent: z.enum(parentNames), categoryChild: z.enum(childNames),
+    coreProductType: z.string().trim().min(2).max(40),
+    titleFeatures: z.array(z.object({ feature: z.string().min(1), evidence: z.string().min(1), evidenceSource: z.enum(["main_image", "sku_image", "sku_name", "attribute", "detail", "original_title"]) })).max(4),
+    removedClaims: z.array(z.object({ claim: z.string().min(1), reason: z.enum(["重复词", "泛化词", "无证据卖点", "来源词", "非核心规格", "风险表述"]) })).max(12),
+    needsReview: z.boolean(), reviewReason: z.string(),
     skuIds: z.array(z.string()).max(50), confidence: z.enum(["HIGH", "MEDIUM", "LOW"]),
     attributes: z.record(z.string(), z.string()).optional(),
   })).min(1).max(12),
@@ -36,7 +40,7 @@ const resultSchema = z.object({ results: z.array(z.object({
 })).max(50) });
 type Row = Record<string, unknown>;
 const record = (value: unknown): Row => value && typeof value === "object" && !Array.isArray(value) ? value as Row : {};
-const PROMPT_VERSION = "offer-combined-recognition-evaluation-v3-standard-selling-title";
+const PROMPT_VERSION = "offer-combined-recognition-evaluation-v4-evidence-naming";
 type Recognition = z.infer<typeof resultSchema>["results"][number];
 
 const categoryKeywordRules: Array<{ pattern: RegExp; categoryParent: keyof typeof categories; categoryChild: string }> = [
@@ -70,6 +74,8 @@ function verifyRecognitionCategory(result: Recognition, offer: ReturnType<typeof
 function normalizeRecognitionOutput(value: unknown) {
   const root = record(value), rawResults = Array.isArray(root.results) ? root.results.map(record) : [];
   const confidence = (input: unknown) => input === "HIGH" || input === "高" ? "HIGH" : input === "LOW" || input === "低" ? "LOW" : "MEDIUM";
+  const evidenceSource = (input: unknown) => ["main_image", "sku_image", "sku_name", "attribute", "detail", "original_title"].includes(String(input)) ? String(input) : "original_title";
+  const removedReason = (input: unknown) => ["重复词", "泛化词", "无证据卖点", "来源词", "非核心规格", "风险表述"].includes(String(input)) ? String(input) : "无证据卖点";
   return { results: rawResults.map((item) => {
     const mixedSelling = item.mixedSelling === true;
     const groups = Array.isArray(item.productGroups) ? item.productGroups.map(record) : [];
@@ -78,25 +84,31 @@ function normalizeRecognitionOutput(value: unknown) {
       : [];
     return {
       ...item,
+      offerId: item.offerId ?? item.offer_id,
       mixedSelling,
-      mixedSellingType: item.mixedSellingType ?? (mixedSelling ? "MULTI_PRODUCT" : "NONE"),
-      offerType: item.offerType ?? (mixedSelling ? "MIXED_SKU" : "SINGLE_PRODUCT"),
+      mixedSellingType: item.mixedSellingType ?? item.mixed_selling_type ?? (mixedSelling ? "MULTI_PRODUCT" : "NONE"),
+      offerType: item.offerType ?? item.offer_type ?? (mixedSelling ? "MIXED_SKU" : "SINGLE_PRODUCT"),
       productGroups: (groups.length ? groups : legacyGroup).map((group) => ({
         ...group,
-        standardName: group.standardName ?? group.productName ?? item.productName,
-        sellingTitle: group.sellingTitle ?? item.sellingTitle ?? group.standardName ?? group.productName ?? item.productName,
-        categoryParent: group.categoryParent ?? item.categoryParent,
-        categoryChild: group.categoryChild ?? item.categoryChild,
-        skuIds: Array.isArray(group.skuIds) ? group.skuIds.map(String) : [],
+        standardName: group.standardName ?? group.standard_product_name ?? group.productName ?? item.standard_product_name ?? item.productName,
+        sellingTitle: group.sellingTitle ?? group.selling_title ?? item.sellingTitle ?? item.selling_title ?? group.standardName ?? group.standard_product_name ?? group.productName ?? item.productName,
+        coreProductType: group.coreProductType ?? group.core_product_type ?? group.categoryChild ?? item.categoryChild ?? group.standardName ?? group.standard_product_name ?? item.productName,
+        titleFeatures: (Array.isArray(group.titleFeatures) ? group.titleFeatures : Array.isArray(group.title_features) ? group.title_features : []).map((entry) => { const feature = record(entry); return { feature: String(feature.feature ?? ""), evidence: String(feature.evidence ?? ""), evidenceSource: evidenceSource(feature.evidenceSource ?? feature.evidence_source) }; }).filter((entry) => entry.feature && entry.evidence),
+        removedClaims: (Array.isArray(group.removedClaims) ? group.removedClaims : Array.isArray(group.removed_claims) ? group.removed_claims : []).map((entry) => { const claim = record(entry); return { claim: String(claim.claim ?? ""), reason: removedReason(claim.reason) }; }).filter((entry) => entry.claim),
+        needsReview: group.needsReview === true || group.needs_review === true,
+        reviewReason: String(group.reviewReason ?? group.review_reason ?? ""),
+        categoryParent: group.categoryParent ?? group.category_parent ?? item.categoryParent ?? item.category_parent,
+        categoryChild: group.categoryChild ?? group.category_child ?? item.categoryChild ?? item.category_child,
+        skuIds: (Array.isArray(group.skuIds) ? group.skuIds : Array.isArray(group.sku_ids) ? group.sku_ids : []).map(String),
         confidence: confidence(group.confidence ?? item.confidence),
         ...(group.attributes && typeof group.attributes === "object" && !Array.isArray(group.attributes)
           ? { attributes: Object.fromEntries(Object.entries(group.attributes as Record<string, unknown>).map(([key, content]) => [key, String(content)])) }
           : {}),
       })),
-      unresolvedSkus: Array.isArray(item.unresolvedSkus) ? item.unresolvedSkus.map(String) : [],
+      unresolvedSkus: (Array.isArray(item.unresolvedSkus) ? item.unresolvedSkus : Array.isArray(item.unresolved_skus) ? item.unresolved_skus : []).map(String),
       evidence: Array.isArray(item.evidence) && item.evidence.length ? item.evidence.map(String) : ["根据标题、图片和SKU信息识别"],
       risks: Array.isArray(item.risks) ? item.risks.map(String) : [],
-      sourceEvaluation: item.sourceEvaluation,
+      sourceEvaluation: item.sourceEvaluation ?? item.source_evaluation,
     };
   }) };
 }
@@ -124,7 +136,7 @@ export async function POST(request: Request) {
   if (!parsed.success) return Response.json({ error: "AI商品识别参数无效" }, { status: 400 });
   const db = await createClient(), { data: auth } = await db.auth.getUser();
   if (!auth.user) return Response.json({ error: "请先登录" }, { status: 401 });
-  const { data: rows, error } = await db.from("source_products").select("id,title,image_url,raw_data").eq("user_id", auth.user.id).eq("sourcing_run_id", parsed.data.runId);
+  const { data: rows, error } = await db.from("source_products").select("id,title,image_url,raw_data,candidate_product_id").eq("user_id", auth.user.id).eq("sourcing_run_id", parsed.data.runId);
   if (error) return Response.json({ error: error.message }, { status: 500 });
   // The current workflow stops rule-rejected offers before every AI stage.
   const eligibleRows = ((rows ?? []) as Row[]).filter((row) => {
@@ -145,16 +157,25 @@ export async function POST(request: Request) {
   const batches = offers.map((offer) => [offer]);
   try {
     const batchResults = await Promise.all(batches.map(async (batch) => {
-      const content: Array<Record<string, unknown>> = [{ type: "text", text: `一次完成商品识别分类与货源评估，但输出必须简短。根据标题、低清主图和SKU名称理解商品并判断混卖。每个productGroup必须同时返回两个名称：standardName是简洁的标准商品名，只保留核心品类、关键材质或结构，用于分类、去重和款型比较；sellingTitle是信息完整的中文售卖标题，按“核心品类+造型/结构+真实材质+主要功能+适用对象或场景”组织，保留有证据的差异化卖点。sellingTitle不得只是standardName的重复或轻微扩写；不得堆砌同义词，不得包含价格、促销、供应商名称，也不得编造输入中没有的材质、功效、规格或承诺。分类必须从固定分类树选择。再根据Offer结构化事实评估货源，不得重复固定阈值、不得设置主备货源、不得猜测SKU价格库存。分类树=${JSON.stringify(categories)}。输出JSON：{"results":[{"offerId":"uuid","offerType":"SINGLE_PRODUCT|MIXED_SKU","productGroups":[{"standardName":"标准商品名","sellingTitle":"完整售卖标题","categoryParent":"父分类","categoryChild":"子分类","skuIds":["sku-id"],"confidence":"HIGH|MEDIUM|LOW","attributes":{}}],"mixedSelling":false,"mixedSellingType":"NONE|VARIANT_ONLY|ACCESSORY_MIX|MULTI_PRODUCT","unresolvedSkus":[],"evidence":["识别依据"],"risks":[],"sourceEvaluation":{"recommendation":"RECOMMENDED|USABLE|CAUTIOUS|NOT_RECOMMENDED","confidence":"HIGH|MEDIUM|LOW","dimensions":{"dropshipFit":"结论","supplyStability":"结论","fulfillmentStability":"结论","qualityConfidence":"结论","supplierStability":"结论"},"directionKey":"功能品类+核心结构+使用场景","advantages":[],"risks":[],"conflicts":[],"missingEvidence":[],"recommendationReason":"理由","finalAdvice":"建议"}}]}` }];
+      const content: Array<Record<string, unknown>> = [{ type: "text", text: `你是AI-shop的商品标准化与淘宝标题生成模块，同时完成SKU分组和货源评估。标准商品名与售卖标题是两个完全不同的任务。
+
+【标准商品名】用于内部归类、商品聚合和货源比较，只回答“这到底是什么商品”。结构为“核心商品词+必要区分特征”。只保留影响购买选择、SKU归并或货源比较的核心用途、主要结构、核心材质、明显造型、关键功能。同类商品跨供应商应尽量使用一致名称。禁止泛化词、交易词、营销卖点、普通颜色尺寸赠品、重复或近义商品词。猫爬架、猫抓柱、猫抓板、猫玩具同时出现时，必须根据图片、结构、现有分类和主要购买目的选择唯一核心商品词；抓挠磨爪为主选猫抓柱/猫抓架，明显多层攀爬休息才选猫爬架。
+
+【售卖标题】用于淘宝搜索、点击和消费者理解。结构为“核心搜索词+造型或材质+核心功能+使用场景或真实卖点”。核心商品词靠前，只保留2至4个有输入证据的特征，语言自然，不堆砌或重复近义词。禁止编造材质、功效、规格或承诺；禁止品牌、授权、官方、正品、第一、最佳；禁止网红、爆款、厂家直销、1688同款；不写供应商、价格、MOQ、代发或物流。颜色尺寸只有构成主要购买差异时才使用。sellingTitle不得超过输入参数maxTitleChars。
+
+【证据】每个进入sellingTitle的特征必须返回titleFeatures证据；证据不足就删除，不得依靠常识补全。优先级：主图/SKU图/明确属性/详情，其次SKU名称，原始标题只作辅助。对“不粘毛、易清洁、耐抓耐磨”等无法由输入明确证明的描述必须删除并写入removedClaims。分类使用输入中的固定分类树和已有分类，不创建新分类；不使用程序名称词典。
+
+再评估货源，但不得重复固定阈值、设置主备货源或猜测SKU价格库存。maxTitleChars=${parsed.data.maxTitleChars}。分类树=${JSON.stringify(categories)}。仅输出JSON：{"results":[{"offerId":"uuid","offerType":"SINGLE_PRODUCT|MIXED_SKU","productGroups":[{"standardName":"","coreProductType":"","sellingTitle":"","titleFeatures":[{"feature":"","evidence":"","evidenceSource":"main_image|sku_image|sku_name|attribute|detail|original_title"}],"removedClaims":[{"claim":"","reason":"重复词|泛化词|无证据卖点|来源词|非核心规格|风险表述"}],"categoryParent":"父分类","categoryChild":"子分类","skuIds":["sku-id"],"confidence":"HIGH|MEDIUM|LOW","needsReview":false,"reviewReason":"","attributes":{}}],"mixedSelling":false,"mixedSellingType":"NONE|VARIANT_ONLY|ACCESSORY_MIX|MULTI_PRODUCT","unresolvedSkus":[],"evidence":["识别依据"],"risks":[],"sourceEvaluation":{"recommendation":"RECOMMENDED|USABLE|CAUTIOUS|NOT_RECOMMENDED","confidence":"HIGH|MEDIUM|LOW","dimensions":{"dropshipFit":"结论","supplyStability":"结论","fulfillmentStability":"结论","qualityConfidence":"结论","supplierStability":"结论"},"directionKey":"现有分类+核心结构+使用场景","advantages":[],"risks":[],"conflicts":[],"missingEvidence":[],"recommendationReason":"理由","finalAdvice":"建议"}}]}` }];
       for (const offer of batch) {
         const sourceRow = eligibleRows.find((row) => String(row.id) === offer.offerId), raw = record(sourceRow?.raw_data);
-        content.push({ type: "text", text: `Offer事实：${JSON.stringify({ offerId: offer.offerId, title: offer.title, productAttributes: withoutPriceFields(offer.productAttributes), skus: offer.skus.map((sku) => ({ id: sku.id, name: sku.name, values: sku.values })), ruleSelection: record(raw.ruleSelection), offerFacts: withoutPriceFields(record(raw.offerFacts)) })}` });
+        const existingRecognition = record(raw.productRecognition);
+        content.push({ type: "text", text: `Offer事实：${JSON.stringify({ offerId: offer.offerId, title: offer.title, existingCategory: { parent: existingRecognition.categoryParent ?? null, child: existingRecognition.categoryChild ?? null }, productAttributes: withoutPriceFields(offer.productAttributes), skus: offer.skus.map((sku) => ({ id: sku.id, name: sku.name, values: sku.values, hasImage: Boolean(sku.image) })), ruleSelection: record(raw.ruleSelection), offerFacts: withoutPriceFields(record(raw.offerFacts)) })}` });
         if (typeof offer.mainImage === "string" && /^https?:/i.test(offer.mainImage)) {
           const imageData = offer.cachedImage?.dataUrl ?? (await downloadAiImage(offer.mainImage)).dataUrl;
           content.push({ type: "image_url", image_url: { url: imageData, detail: "low" } });
         }
       }
-      const response = await fetch(`${baseUrl}/chat/completions`, { method: "POST", headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, body: JSON.stringify({ model, messages: [{ role: "system", content: "关闭深度思考。只输出合法JSON；分类必须来自给定分类树。standardName保持简洁，sellingTitle信息完整，其余文字结论也应简明。" }, { role: "user", content }], response_format: { type: "json_object" }, max_tokens: 1400, stream: false, thinking: { type: "disabled" } }), signal: AbortSignal.timeout(45_000) });
+      const response = await fetch(`${baseUrl}/chat/completions`, { method: "POST", headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, body: JSON.stringify({ model, messages: [{ role: "system", content: "关闭深度思考。只输出合法JSON。标准商品名用于同类统一，售卖标题必须真实自然且逐项提供证据；分类只能来自给定分类树。" }, { role: "user", content }], response_format: { type: "json_object" }, max_tokens: 1800, stream: false, thinking: { type: "disabled" } }), signal: AbortSignal.timeout(45_000) });
       const responseText = await response.text();
       let body: { choices?: Array<{ message?: { content?: string } }>; error?: { message?: string } } = {};
       try { body = responseText ? JSON.parse(responseText) as typeof body : {}; } catch { throw new Error(`视觉模型返回了无法解析的响应（HTTP ${response.status}）`); }
@@ -191,6 +212,18 @@ export async function POST(request: Request) {
   const persisted = await Promise.all(persistence);
   const persistenceError = persisted.find((result) => result.error)?.error;
   if (persistenceError) return Response.json({ error: persistenceError.message }, { status: 500 });
+  for (const row of eligibleRows) {
+    const candidateId = typeof row.candidate_product_id === "string" ? row.candidate_product_id : null;
+    const result = byId.get(String(row.id));
+    const primary = result?.productGroups[0];
+    if (!candidateId || !primary) continue;
+    const candidate = await db.from("candidate_products").select("notes").eq("id", candidateId).eq("user_id", auth.user.id).maybeSingle();
+    if (candidate.error) return Response.json({ error: candidate.error.message }, { status: 500 });
+    const trace = (() => { try { return record(JSON.parse(candidate.data?.notes ?? "{}")); } catch { return {}; } })();
+    if (record(trace.listing).status) continue;
+    const synced = await db.from("candidate_products").update({ name: primary.sellingTitle, category: primary.categoryChild }).eq("id", candidateId).eq("user_id", auth.user.id);
+    if (synced.error) return Response.json({ error: synced.error.message }, { status: 500 });
+  }
   await db.from("ai_runs").insert({ id: analysisRunId, user_id: auth.user.id, type: "AI_PRODUCT_RECOGNITION_V1", model, input_json: { sourcing_run_id: parsed.data.runId, inputHash }, output_json: { results: allResults }, status: "success", latency_ms: Math.round(performance.now() - started), adopted: false });
   return Response.json({ ok: true, deduplicated: false, analyzedAt, results: allResults });
 }

@@ -17,6 +17,7 @@ type Run = {
 function businessStatus(run: Run) {
   if (run.hasPrimary) return "已选择";
   if (run.stages.aiTotal > 0 && run.stages.aiCompleted === run.stages.aiTotal) return "待决定";
+  if (run.stages.screened === run.stages.total && run.stages.total > 0 && run.stages.passed === 0) return "无可用货源";
   if (run.stages.screened === run.stages.total && run.stages.total > 0) return "待AI分析";
   if (run.stages.detailed === run.stages.total && run.stages.total > 0) return "待规则初筛";
   if (run.stages.searched > 0) return "待解析";
@@ -31,6 +32,23 @@ function createdAt(value: string) {
     minute: "2-digit",
     hour12: false,
   }).format(new Date(value));
+}
+
+function resultSummary(run: Run) {
+  const parts = [`搜索结果 ${run.stages.searched}`];
+  if (run.stages.detailed < run.stages.total) {
+    parts.push(`已解析 ${run.stages.detailed}/${run.stages.total}`);
+    return parts.join(" · ");
+  }
+  if (run.stages.screened < run.stages.total) {
+    parts.push("解析完成", "待规则初筛");
+    return parts.join(" · ");
+  }
+  parts.push(`规则通过 ${run.stages.passed}`);
+  if (run.stages.aiTotal > 0) parts.push(`AI完成 ${run.stages.aiCompleted}/${run.stages.aiTotal}`);
+  else parts.push(run.stages.passed > 0 ? "待AI分析" : "无可分析货源");
+  if (run.hasPrimary) parts.push("已选择货源");
+  return parts.join(" · ");
 }
 
 export function SourcingTaskIndex({
@@ -71,14 +89,7 @@ export function SourcingTaskIndex({
                 <h2>{run.query}</h2>
                 <span className={`v2-pill ${state === "已选择" ? "success" : state === "待决定" ? "reading" : ""}`}>{state}</span>
               </div>
-              <div className="task-stage-overview" aria-label="阶段总览">
-                {[
-                  { label: "搜索", value: `${run.stages.searched} 条`, done: run.stages.searched > 0 },
-                  { label: "解析", value: `${run.stages.detailed}/${run.stages.total}`, done: run.stages.total > 0 && run.stages.detailed === run.stages.total },
-                  { label: "规则", value: run.stages.screened ? `${run.stages.passed} 条通过` : "待运行", done: run.stages.total > 0 && run.stages.screened === run.stages.total },
-                  { label: "AI分析", value: run.stages.aiTotal ? `${run.stages.aiCompleted}/${run.stages.aiTotal}` : "待运行", done: run.stages.aiTotal > 0 && run.stages.aiCompleted === run.stages.aiTotal },
-                ].map((stage, index) => <div className={stage.done ? "done" : ""} key={stage.label}><i>{stage.done ? "✓" : index + 1}</i><span><b>{stage.label}</b><small>{stage.value}</small></span></div>)}
-              </div>
+              <p className="sourcing-task-result">{resultSummary(run)}</p>
               <div className="sourcing-task-foot">
                 <time dateTime={run.created_at}>{createdAt(run.created_at)}</time>
                 <b>进入任务 →</b>

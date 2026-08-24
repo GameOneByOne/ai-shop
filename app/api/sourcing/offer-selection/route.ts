@@ -3,6 +3,9 @@ import { createClient } from "@/lib/supabase/server";
 
 const record = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+const traceOf = (value: string | null): Record<string, unknown> => {
+  try { return record(JSON.parse(value ?? "{}")); } catch { return {}; }
+};
 const numberValue = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : null;
 const booleanValue = (value: unknown) => typeof value === "boolean" ? value : null;
 
@@ -73,14 +76,16 @@ export async function POST(request: Request) {
       selectedAt,
     };
     const marker = `"sourceOfferId":"${offer.id}"`;
-    const existing = await db.from("candidate_products").select("id").eq("user_id", auth.user.id).ilike("notes", `%${marker}%`).limit(1).maybeSingle();
+    const listingName = String(recognition.sellingTitle ?? recognition.standardName ?? recognition.productName ?? offer.title ?? `1688 商品 ${offer.external_id ?? ""}`);
+    const listingCategory = String(recognition.categoryChild ?? recognition.categoryParent ?? "待分类");
+    const existing = await db.from("candidate_products").select("id,notes").eq("user_id", auth.user.id).ilike("notes", `%${marker}%`).limit(1).maybeSingle();
     if (existing.error) return Response.json({ error: existing.error.message }, { status: 500 });
     productId = existing.data?.id ?? null;
     if (!productId) {
       const created = await db.from("candidate_products").insert({
         user_id: auth.user.id,
-        name: String(recognition.sellingTitle ?? recognition.standardName ?? recognition.productName ?? offer.title ?? `1688 商品 ${offer.external_id ?? ""}`),
-        category: String(recognition.categoryChild ?? recognition.categoryParent ?? "待分类"),
+        name: listingName,
+        category: listingCategory,
         description: "由已选择货源自动建立，进入商品中心继续完成铺货资料。",
         estimated_cost: priceMin,
         status: "approved",
@@ -90,6 +95,12 @@ export async function POST(request: Request) {
       if (created.error || !created.data)
         return Response.json({ error: created.error?.message ?? "创建商品中心记录失败" }, { status: 500 });
       productId = created.data.id;
+    } else {
+      const existingTrace = traceOf(existing.data?.notes ?? null);
+      if (!record(existingTrace.listing).status) {
+        const synced = await db.from("candidate_products").update({ name: listingName, category: listingCategory }).eq("id", productId).eq("user_id", auth.user.id);
+        if (synced.error) return Response.json({ error: synced.error.message }, { status: 500 });
+      }
     }
     const linked = await db.from("source_products").update({ candidate_product_id: productId, decision_status: "candidate" }).eq("id", offer.id);
     if (linked.error) return Response.json({ error: linked.error.message }, { status: 500 });

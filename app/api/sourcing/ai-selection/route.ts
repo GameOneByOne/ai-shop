@@ -136,7 +136,7 @@ export async function POST(request: Request) {
   const candidates = ((rows ?? []) as Row[]).filter((row) => {
     const raw = record(row.raw_data), selection = record(raw.sourcingSelection), ruleDecision = selection.ruleOverride === true ? "PASSED" : String(record(raw.ruleSelection).decision ?? ""), recognition = record(raw.productRecognition);
     return ruleDecision !== "REJECTED" && ["PASSED", "PENDING", "PRIMARY", "BACKUP"].includes(ruleDecision)
-      && ["offer-product-recognition-v3-category-review", "offer-product-recognition-v4-single", "offer-combined-recognition-evaluation-v1", "offer-combined-recognition-evaluation-v2-selling-name", "offer-combined-recognition-evaluation-v3-standard-selling-title"].includes(String(recognition.promptVersion)) && Array.isArray(recognition.productGroups) && recognition.productGroups.length > 0
+      && ["offer-product-recognition-v3-category-review", "offer-product-recognition-v4-single", "offer-combined-recognition-evaluation-v1", "offer-combined-recognition-evaluation-v2-selling-name", "offer-combined-recognition-evaluation-v3-standard-selling-title", "offer-combined-recognition-evaluation-v4-evidence-naming"].includes(String(recognition.promptVersion)) && Array.isArray(recognition.productGroups) && recognition.productGroups.length > 0
       && Array.isArray(recognition.unresolvedSkus) && recognition.unresolvedSkus.length === 0;
   }).filter((row) => !parsed.data.offerIds || parsed.data.offerIds.includes(String(row.id)));
   if (!candidates.length) return Response.json({ error: "没有同时满足规则未淘汰、商品识别完成且SKU关系明确的货源" }, { status: 409 });

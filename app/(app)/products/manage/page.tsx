@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { requireUser } from "@/lib/data/auth";
 import { createClient } from "@/lib/supabase/server";
+import { aiListingIdentity } from "@/lib/sourcing/listing-identity";
 
 type ProductRow = {
   id: string;
@@ -32,8 +33,14 @@ export default async function Page({ searchParams }: { searchParams: Promise<Rec
     const trace = traceOf(product.notes);
     return typeof trace.sourceOfferId === "string" && typeof trace.sourceUrl === "string";
   });
-  const listedCount = realProducts.filter((product) => (traceOf(product.notes).listing as Record<string, unknown> | undefined)?.status === "LISTED").length;
-  const products = realProducts.filter((product) => ((traceOf(product.notes).listing as Record<string, unknown> | undefined)?.status === "LISTED") === (stage === "listed"));
+  const sourceOfferIds = realProducts.map((product) => traceOf(product.notes).sourceOfferId).filter((id): id is string => typeof id === "string");
+  const sourceResult = sourceOfferIds.length
+    ? await db.from("source_products").select("id,raw_data").eq("user_id", user.id).in("id", sourceOfferIds)
+    : { data: [], error: null };
+  const aiIdentityByOffer = new Map((sourceResult.data ?? []).map((source) => [source.id, aiListingIdentity(source.raw_data)]));
+  const isTrulyListed = (product: ProductRow) => { const listing = (traceOf(product.notes).listing as Record<string, unknown> | undefined); return listing?.status === "LISTED" && typeof listing.taobaoItemId === "string" && Boolean(listing.taobaoItemId); };
+  const listedCount = realProducts.filter(isTrulyListed).length;
+  const products = realProducts.filter((product) => isTrulyListed(product) === (stage === "listed"));
   return <>
     <header className="top"><div><div className="eyebrow">商品中心</div><h1>商品管理</h1><p className="muted">选择货源后，商品从这里完成制作、上架和后续经营。</p></div><Link className="secondary-btn button-link" href="/products/discover">继续发现货源</Link></header>
     {result.error && <div className="status-box error">商品读取失败：{result.error.message}</div>}
@@ -43,10 +50,14 @@ export default async function Page({ searchParams }: { searchParams: Promise<Rec
       const supplier = typeof trace.supplierName === "string" ? trace.supplierName : null;
       const offerId = typeof trace.externalOfferId === "string" ? trace.externalOfferId : null;
       const sourceUrl = typeof trace.sourceUrl === "string" ? trace.sourceUrl : null;
-      const listed = (trace.listing as Record<string, unknown> | undefined)?.status === "LISTED";
+      const listing = (trace.listing as Record<string, unknown> | undefined);
+      const listed = listing?.status === "LISTED" && typeof listing.taobaoItemId === "string" && Boolean(listing.taobaoItemId);
+      const awaitingExternalPublish = listing?.status === "SETTINGS_SAVED" || (listing?.status === "LISTED" && !listed);
+      const offerIdentity = typeof trace.sourceOfferId === "string" ? aiIdentityByOffer.get(trace.sourceOfferId) : null;
+      const displayName = listed ? product.name : offerIdentity?.name ?? product.name;
       return <article className={`card product-work-card${focused === product.id ? " active" : ""}`} key={product.id}>
-        <div className="proposal-head"><div className="offer-product-cell">{image && <img className="v2-mini-img" src={image} alt="" />}<div><span className="eyebrow">{listed ? "已上架" : "待铺货"}</span><h2>{product.name}</h2><p className="muted">{supplier ?? "供应商已随货源保存"}{offerId ? ` · offerId ${offerId}` : ""}</p></div></div><span className={`v2-pill ${listed ? "success" : "reading"}`}>{listed ? "已上架" : "待铺货"}</span></div>
-        <div className="candidate-facts"><div><span>已选货源</span><b>{offerId ?? "已绑定"}</b></div><div><span>采购价</span><b>{product.estimated_cost == null ? "—" : `¥${Number(product.estimated_cost).toFixed(2)}`}</b></div><div><span>素材</span><b>{image ? "沿用货源素材" : "货源素材待同步"}</b></div><div><span>状态</span><b>{listed ? "铺货完成" : "等待设置"}</b></div></div>
+        <div className="proposal-head"><div className="offer-product-cell">{image && <img className="v2-mini-img" src={image} alt="" />}<div><span className="eyebrow">{listed ? "已上架" : "待铺货"}</span><h2>{displayName}</h2><p className="muted">{supplier ?? "供应商已随货源保存"}{offerId ? ` · offerId ${offerId}` : ""}</p></div></div><span className={`v2-pill ${listed ? "success" : "reading"}`}>{listed ? "已上架" : "待铺货"}</span></div>
+        <div className="candidate-facts"><div><span>已选货源</span><b>{offerId ?? "已绑定"}</b></div><div><span>采购价</span><b>{product.estimated_cost == null ? "—" : `¥${Number(product.estimated_cost).toFixed(2)}`}</b></div><div><span>素材</span><b>{image ? "沿用货源素材" : "货源素材待同步"}</b></div><div><span>状态</span><b>{listed ? "淘宝已上架" : awaitingExternalPublish ? "待1688铺货" : "等待设置"}</b></div></div>
         <div className="action-buttons">{sourceUrl && <a className="secondary-btn" href={sourceUrl} target="_blank" rel="noreferrer">打开1688</a>}<Link className="btn button-link" href={`/content?product=${product.id}`}>{listed ? "查看铺货结果" : "立即铺货"}</Link></div>
       </article>;
     })}</div>}
