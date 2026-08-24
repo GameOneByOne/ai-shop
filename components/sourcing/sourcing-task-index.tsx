@@ -10,6 +10,7 @@ type Run = {
   eligible_count: number | null;
   created_at: string;
   completed_at: string | null;
+  criteria: Record<string, unknown> | null;
   hasPrimary: boolean;
   stages: { searched: number; detailed: number; total: number; screened: number; passed: number; aiCompleted: number; aiTotal: number };
 };
@@ -34,6 +35,25 @@ function createdAt(value: string) {
   }).format(new Date(value));
 }
 
+function runDuration(run: Run) {
+  const started = Date.parse(run.created_at);
+  const ended = run.completed_at ? Date.parse(run.completed_at) : Date.now();
+  if (!Number.isFinite(started) || !Number.isFinite(ended)) return "用时待记录";
+  const seconds = Math.max(0, Math.floor((ended - started) / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainingSeconds = seconds % 60;
+  const value = hours ? `${hours}小时${minutes}分` : minutes ? `${minutes}分${String(remainingSeconds).padStart(2, "0")}秒` : `${remainingSeconds}秒`;
+  return `${run.completed_at ? "用时" : "已运行"} ${value}`;
+}
+
+function extensionVersion(run: Run) {
+  const value = run.criteria?.extensionVersion;
+  return typeof value === "string" && value.trim()
+    ? `扩展 v${value.trim()}`
+    : "扩展版本未记录";
+}
+
 function resultSummary(run: Run) {
   const parts = [`搜索结果 ${run.stages.searched}`];
   if (run.stages.detailed < run.stages.total) {
@@ -49,6 +69,21 @@ function resultSummary(run: Run) {
   else parts.push(run.stages.passed > 0 ? "待AI分析" : "无可分析货源");
   if (run.hasPrimary) parts.push("已选择货源");
   return parts.join(" · ");
+}
+
+function searchConditions(run: Run) {
+  const criteria = run.criteria ?? {};
+  const filters = criteria.searchFilters && typeof criteria.searchFilters === "object" ? criteria.searchFilters as Record<string, unknown> : {};
+  const values: string[] = [`目标 ${Number(criteria.targetOfferCount) || run.stages.searched} 条`];
+  if (filters.sort && filters.sort !== "综合") values.push(`${filters.sort}排序`);
+  if (filters.priceMin || filters.priceMax) values.push(`价格 ${filters.priceMin || "不限"}–${filters.priceMax || "不限"}`);
+  if (filters.minOrder) values.push(`起订量 ≤ ${filters.minOrder}`);
+  if (filters.shopProductMin || filters.shopProductMax) values.push(`店铺商品 ${filters.shopProductMin || "不限"}–${filters.shopProductMax || "不限"}`);
+  for (const value of [filters.region, filters.merchantFeature, filters.businessMode, filters.encryptedWaybill, filters.latePickupCompensation]) if (value) values.push(String(value));
+  for (const [label, value] of [["24H支揽率", filters.pickup24Rate], ["48H支揽率", filters.pickup48Rate]]) if (value) values.push(`${label} ${value}`);
+  if (Array.isArray(filters.flags)) values.push(...filters.flags.map(String));
+  if (filters.mergeSuppliers) values.push("合并同款供应商");
+  return [...new Set(values)];
 }
 
 export function SourcingTaskIndex({
@@ -96,8 +131,9 @@ export function SourcingTaskIndex({
                 <span className={`v2-pill ${state === "已选择" ? "success" : state === "待决定" ? "reading" : ""}`}>{state}</span>
               </div>
               <p className="sourcing-task-result">{resultSummary(run)}</p>
+              <div className="sourcing-task-conditions" aria-label="本轮搜索条件"><span>搜索条件</span><div>{searchConditions(run).map((condition) => <i key={condition}>{condition}</i>)}</div></div>
               <div className="sourcing-task-foot">
-                <time dateTime={run.created_at}>{createdAt(run.created_at)}</time>
+                <div><time dateTime={run.created_at}>{createdAt(run.created_at)}</time><span>{runDuration(run)}</span><span>{extensionVersion(run)}</span></div>
                 <b>进入任务 →</b>
               </div>
             </div>

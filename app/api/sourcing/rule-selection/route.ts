@@ -2,7 +2,10 @@ import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import { DEFAULT_OFFER_RULE_CONFIG, filterOffer, type OfferFacts, type OfferRuleConfig } from "@/lib/sourcing/offer-filter";
 
-const schema = z.object({ runId: z.string().uuid() });
+const schema = z.object({
+  runId: z.string().uuid(),
+  action: z.enum(["RUN", "RESET"]).default("RUN"),
+});
 type Row = Record<string, unknown>;
 const record = (value: unknown): Row =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Row : {};
@@ -40,8 +43,31 @@ export async function POST(request: Request) {
     .eq("user_id", auth.user.id)
     .eq("sourcing_run_id", parsed.data.runId);
   if (error) return Response.json({ error: error.message }, { status: 500 });
+  if (parsed.data.action === "RESET") {
+    const resetAt = new Date().toISOString();
+    const resetResults = await Promise.all((data ?? []).map((row) => {
+      const raw = record(row.raw_data), existing = record(raw.sourcingSelection);
+      const { ruleSelection: _ruleSelection, ...rawWithoutRuleSelection } = raw;
+      const keepsHumanDecision = ["PRIMARY", "BACKUP", "REJECTED"].includes(String(existing.status)) && existing.selectedBy !== "RULE_SCREENING";
+      const sourcingSelection = keepsHumanDecision ? existing : {
+        ...existing,
+        status: "CANDIDATE",
+        selectedAt: resetAt,
+        selectedBy: "RULE_RESET",
+        ruleOverride: false,
+      };
+      return db.from("source_products").update({ raw_data: {
+        ...rawWithoutRuleSelection,
+        sourcingSelection,
+      } }).eq("id", row.id);
+    }));
+    const resetError = resetResults.find((result) => result.error)?.error;
+    if (resetError) return Response.json({ error: resetError.message }, { status: 500 });
+    return Response.json({ ok: true, reset: true, total: data?.length ?? 0, resetAt });
+  }
   const screenedAt = new Date().toISOString();
-  let rejected = 0, passed = 0, preserved = 0;
+  let rejected = 0, passed = 0, pending = 0, preserved = 0;
+  const passedOfferIds: string[] = [];
   const updates: Array<PromiseLike<{ error: { message: string } | null }>> = [];
   for (const row of data ?? []) {
     const raw = record(row.raw_data), existing = record(raw.sourcingSelection), detail = record(raw.detailEnrichment);
@@ -57,16 +83,22 @@ export async function POST(request: Request) {
       skuInStockCount: inStockSkus.length,
       skuAvailabilityRate: knownStockSkus.length ? Math.round(inStockSkus.length / knownStockSkus.length * 1000) / 10 : null,
     } as unknown as OfferFacts, ruleConfig);
-    const manuallySelected = (["PRIMARY", "BACKUP", "REJECTED"].includes(String(existing.status)) || existing.ruleOverride === true) && existing.selectedBy !== "RULE_SCREENING";
+    // Re-running rules starts a fresh screening round. A previous CANDIDATE
+    // override only restored that earlier round and must not silently turn
+    // every later AI run into a full-scope run. Explicit primary, backup and
+    // human-rejected decisions remain protected.
+    const manuallySelected = ["PRIMARY", "BACKUP", "REJECTED"].includes(String(existing.status)) && existing.selectedBy !== "RULE_SCREENING";
     const decision = qualification.decision;
     if (decision === "REJECTED") rejected += 1;
-    else if (decision === "PASSED") passed += 1;
+    else if (decision === "PASSED") { passed += 1; passedOfferIds.push(String(row.id)); }
+    else pending += 1;
     if (manuallySelected) preserved += 1;
     const sourcingSelection = manuallySelected ? existing : {
       ...existing,
       status: "CANDIDATE",
       selectedAt: screenedAt,
       selectedBy: "RULE_SCREENING",
+      ruleOverride: false,
     };
     updates.push(db.from("source_products").update({ raw_data: {
       ...raw,
@@ -87,5 +119,5 @@ export async function POST(request: Request) {
   const updateResults = await Promise.all(updates);
   const failedUpdate = updateResults.find((result) => result.error)?.error;
   if (failedUpdate) return Response.json({ error: failedUpdate.message }, { status: 500 });
-  return Response.json({ ok: true, total: data?.length ?? 0, rejected, passed, preserved, screenedAt });
+  return Response.json({ ok: true, total: data?.length ?? 0, rejected, passed, pending, preserved, screenedAt, passedOfferIds });
 }

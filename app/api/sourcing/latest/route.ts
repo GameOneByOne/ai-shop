@@ -184,6 +184,10 @@ export async function GET(request: Request) {
     runId: run.id,
     sourcingRunId: run.id,
     query: run.query,
+    aiApplyRules:
+      typeof (criteria.offerAiSelection as Record<string, unknown> | undefined)?.applyRules === "boolean"
+        ? Boolean((criteria.offerAiSelection as Record<string, unknown>).applyRules)
+        : null,
     keywords,
     products: rows,
     v3,

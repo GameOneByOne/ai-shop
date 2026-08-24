@@ -207,6 +207,8 @@ export function SourcingDiscovery({
   const modeRef = useRef<CaptureMode>("offers");
   const activeRunRef = useRef(initialRunId ?? "");
   const lastCaptureStageRef = useRef("");
+  const checkpointQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const failedCheckpointBatchesRef = useRef<unknown[][]>([]);
   useEffect(() => {
     if (!busy || captureStartedAt == null) return;
     const interval = window.setInterval(() => setCaptureNow(Date.now()), 1000);
@@ -354,15 +356,18 @@ export function SourcingDiscovery({
   }, []);
 
   useEffect(() => {
-    const receive = (event: MessageEvent) => {
+    const receive = async (event: MessageEvent) => {
       if (
         event.origin !== location.origin ||
         event.data.requestId !== requestRef.current
       )
         return;
       if (event.data?.type === "AI_SHOP_CAPTURE_PROGRESS") {
-        const progressMessage = event.data.message ||
+        const rawProgressMessage = event.data.message ||
           `已处理 ${event.data.completed}/${event.data.total} 个 Offer（成功 ${event.data.succeeded}，失败 ${event.data.failed}）`;
+        const progressMessage = String(rawProgressMessage)
+          .replace(/正在解析“([^”]+)”第 (\d+) 页商品卡片/g, "正在获取“$1”第 $2 页货源")
+          .replace(/“([^”]+)”第 (\d+) 页解析完成，新增 (\d+) 条 Offer/g, "“$1”第 $2 页获取完成，新增 $3 条货源");
         lastCaptureStageRef.current = progressMessage;
         armCaptureWatchdog(
           event.data.requestId,
@@ -376,6 +381,25 @@ export function SourcingDiscovery({
           failed: Number(event.data.failed ?? 0),
         });
         setProgress(progressMessage);
+        return;
+      }
+      if (event.data?.type === "AI_SHOP_CAPTURE_CHECKPOINT") {
+        const batch = Array.isArray(event.data.details) ? event.data.details : [];
+        if (!batch.length) return;
+        const checkpointRunId = activeRunRef.current || runId;
+        const factsOnly = modeRef.current === "facts";
+        checkpointQueueRef.current = checkpointQueueRef.current.then(async () => {
+          try {
+            await post("/api/sourcing/enrich", {
+              runId: checkpointRunId,
+              details: batch,
+              factsOnly,
+              checkpoint: true,
+            });
+          } catch {
+            failedCheckpointBatchesRef.current.push(batch);
+          }
+        });
         return;
       }
       if (event.data?.type !== "AI_SHOP_CAPTURE_RESULT") return;
@@ -402,14 +426,32 @@ export function SourcingDiscovery({
               query,
               keywords,
               targetOfferCount,
+              extensionVersion: event.data.extensionVersion,
               collection: event.data.collection,
               items: event.data.items,
             })
-          : post("/api/sourcing/enrich", {
-              runId,
-              details: event.data.details,
-              factsOnly: completedMode === "facts",
-            });
+          : (async () => {
+              await checkpointQueueRef.current;
+              const retryBatches = failedCheckpointBatchesRef.current.splice(0);
+              for (const batch of retryBatches) {
+                await post("/api/sourcing/enrich", {
+                  runId: activeRunRef.current || runId,
+                  details: batch,
+                  factsOnly: completedMode === "facts",
+                  checkpoint: true,
+                });
+              }
+              const checkpointedCount = Number(event.data.checkpointedCount ?? 0);
+              if (checkpointedCount <= 0)
+                throw new Error("本轮没有成功解析任何货源详情，不能将解析阶段标记为完成；请更新扩展并重新解析缺失项");
+              return post("/api/sourcing/enrich", {
+                runId: activeRunRef.current || runId,
+                details: [],
+                factsOnly: completedMode === "facts",
+                finalize: true,
+                totalDetails: checkpointedCount,
+              });
+            })();
 
       void operation
         .then(async (body) => {
@@ -465,7 +507,7 @@ export function SourcingDiscovery({
       // 搜索条件已由 1688 页面应用。此处不能在详情字段尚未解析时
       // 再用空值做一次本地过滤，否则真实 Offer 会在解析前被误删。
       .sort((a, b) => b.rough_score - a.rough_score)
-      .slice(0, 50)
+      .slice(0, targetOfferCount)
       .map((x) => ({
         id: x.id,
         externalId: x.external_id,
@@ -488,6 +530,8 @@ export function SourcingDiscovery({
     modeRef.current = captureMode;
     setRunId(targetRunId);
     activeRunRef.current = targetRunId;
+    checkpointQueueRef.current = Promise.resolve();
+    failedCheckpointBatchesRef.current = [];
     setBusy(captureMode);
     setDirections([]);
     setProgress(
@@ -678,6 +722,25 @@ export function SourcingDiscovery({
       pending: items.length - captured.length,
     };
   }, [items]);
+  const captureElapsedSeconds = Math.max(0, Math.floor((captureNow - (captureStartedAt ?? captureNow)) / 1000));
+  const captureElapsedLabel = `${Math.floor(captureElapsedSeconds / 60) ? `${Math.floor(captureElapsedSeconds / 60)}分` : ""}${String(captureElapsedSeconds % 60).padStart(2, "0")}秒`;
+  const capturePercent = captureProgress ? Math.min(100, Math.round((captureProgress.completed / Math.max(1, captureProgress.total)) * 100)) : 0;
+  const captureIsSearching = busy === "offers";
+  const captureTitle = captureIsSearching ? "正在获取货源" : "正在解析货源详情";
+  const captureProgressPanel = busy && captureProgress ? (
+    <div className="card product-work-card capture-progress" aria-live="polite">
+      <div className="proposal-head capture-progress-head">
+        <div className="product-work-copy"><span className="eyebrow">{captureIsSearching ? "获取进度" : "解析进度"}</span><h2>{captureTitle}</h2><p className="muted capture-progress-stage">{progress || (captureIsSearching ? "正在准备 1688 搜索结果…" : "正在准备解析货源详情…")}</p></div>
+        <span className="v2-pill orange">已运行 {captureElapsedLabel}</span>
+      </div>
+      <div className="candidate-facts capture-progress-facts">
+        <div><span>处理进度</span><b>{captureProgress.completed} / {captureProgress.total || "—"}</b></div>
+        <div><span>{captureIsSearching ? "已获取货源" : "解析成功"}</span><b>{captureProgress.succeeded}</b></div>
+        <div><span>当前进度</span><b>{capturePercent}%</b></div>
+      </div>
+      <progress value={captureProgress.completed} max={Math.max(1, captureProgress.total)} aria-label={`货源搜索进度 ${capturePercent}%`} />
+    </div>
+  ) : null;
 
   return (
     <>
@@ -729,8 +792,8 @@ export function SourcingDiscovery({
             onChange={(e) => setKeywordText(e.target.value)}
           />
         </label>}
-        <label>
-          本轮目标商品数
+        <label className={createMode ? "sourcing-target-compact" : undefined}>
+          <span>本轮目标商品数</span>
           <input
             className="input"
             type="number"
@@ -739,7 +802,7 @@ export function SourcingDiscovery({
             value={targetOfferCount}
             onChange={(event) => setTargetOfferCount(Math.max(1, Math.min(500, Number(event.target.value) || 1)))}
           />
-          <small>默认 20。多个关键词累计去重，每个新 Offer 计 1 个，达到数量后停止搜索。</small>
+          {!createMode && <small>默认 20。多个关键词累计去重，每个新 Offer 计 1 个，达到数量后停止搜索。</small>}
         </label>
         <div className="auth-actions">
           {!createMode && <button
@@ -788,27 +851,7 @@ export function SourcingDiscovery({
             {clustering ? "正在评估候选货源…" : "AI选择货源"}
           </button>}
         </div>
-
-        {busy && captureProgress && (
-          <div className="capture-progress" aria-live="polite">
-            <div>
-              <b>
-                正在获取货源
-              </b>
-              <span>
-                {captureProgress.completed} / {captureProgress.total || "—"} · 已运行 {(() => { const seconds = Math.max(0, Math.floor((captureNow - (captureStartedAt ?? captureNow)) / 1000)); const minutes = Math.floor(seconds / 60); return minutes ? `${minutes}分${String(seconds % 60).padStart(2, "0")}秒` : `${seconds}秒`; })()}
-              </span>
-            </div>
-            <progress
-              value={captureProgress.completed}
-              max={Math.max(1, captureProgress.total)}
-            />
-            <small>
-              已获得有效货源 {captureProgress.succeeded}
-            </small>
-            {progress && <p className="capture-progress-stage">{progress}</p>}
-          </div>
-        )}
+        {captureProgressPanel}
 
         {(error || (!busy && progress)) && (
           <div className={`status-box${error ? " error" : ""}`}>

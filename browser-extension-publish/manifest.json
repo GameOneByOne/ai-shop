@@ -1,16 +1,16 @@
 {
   "manifest_version": 3,
-  "name": "AI 店长 1688 货源采集",
-  "version": "0.12.8",
-  "description": "独立负责 1688 搜索、商品详情与 SourceSKU 采集。",
-  "permissions": ["tabs", "scripting"],
+  "name": "AI 店长 1688 一键铺货",
+  "version": "0.1.1",
+  "description": "独立负责从 1688 确认店铺、立即铺货并识别新建淘宝商品。",
+  "permissions": ["tabs", "scripting", "debugger"],
   "host_permissions": [
-    "https://s.1688.com/*",
     "https://detail.1688.com/*",
     "https://sale.1688.com/*",
     "https://*.1688.com/*",
     "https://1688.com/*",
     "https://*.alibaba.com/*",
+    "https://*.taobao.com/*",
     "http://localhost:3000/*"
   ],
   "background": { "service_worker": "background.js" },
@@ -21,7 +21,7 @@
       "run_at": "document_start"
     },
     {
-      "matches": ["https://s.1688.com/*", "https://detail.1688.com/*"],
+      "matches": ["https://detail.1688.com/*"],
       "js": ["page-scraper.js"],
       "run_at": "document_idle"
     }

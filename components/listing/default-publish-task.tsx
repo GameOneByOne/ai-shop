@@ -116,7 +116,7 @@ export function DefaultPublishTask({ productId, started }: { productId: string; 
         }
         setRunning(false);
         setState("error");
-        const errorMessage = "铺货扩展未响应。请在扩展管理页重载 AI 店长 1688 采集桥，然后刷新本页重试。";
+        const errorMessage = "铺货扩展未响应。请在扩展管理页重载 AI 店长 1688 一键铺货，然后刷新本页重试。";
         setMessage(errorMessage);
         markFailed(errorMessage);
       }, 12000);

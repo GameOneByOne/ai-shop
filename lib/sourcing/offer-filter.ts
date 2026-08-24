@@ -1,5 +1,5 @@
 export type OfferStatus = "PASS" | "REJECT";
-export type StableSourceDecision = "PASSED" | "REJECTED";
+export type StableSourceDecision = "PASSED" | "PENDING" | "REJECTED";
 export type DimensionGrade = "优秀" | "合格" | "良好" | "风险" | "待确认" | "不合格";
 
 export interface OfferFacts {
@@ -27,11 +27,12 @@ export interface OfferFilterResult {
 }
 
 export interface OfferRuleConfig { requireOnePiece: boolean; require1688Selection: boolean; requireReturnShipping: boolean; requireNoReasonReturn: boolean; rejectNoSellableSku: boolean; requireSingleOrder: boolean; rejectInvalidProduct: boolean; rejectMissingCriticalData: boolean; pickup48Min: number; qualityMin: number; reviewCountMin: number; productFavoriteMin: number; positiveReviewMin: number }
-export const DEFAULT_OFFER_RULE_CONFIG: OfferRuleConfig = { requireOnePiece: true, require1688Selection: false, requireReturnShipping: false, requireNoReasonReturn: false, rejectNoSellableSku: true, requireSingleOrder: true, rejectInvalidProduct: true, rejectMissingCriticalData: false, pickup48Min: 70, qualityMin: 70, reviewCountMin: 0, productFavoriteMin: 0, positiveReviewMin: 0 };
+export const DEFAULT_OFFER_RULE_CONFIG: OfferRuleConfig = { requireOnePiece: true, require1688Selection: false, requireReturnShipping: true, requireNoReasonReturn: true, rejectNoSellableSku: true, requireSingleOrder: true, rejectInvalidProduct: true, rejectMissingCriticalData: false, pickup48Min: 60, qualityMin: 70, reviewCountMin: 20, productFavoriteMin: 10, positiveReviewMin: 85 };
 
 export function normalizeRuleDecision(value: unknown): StableSourceDecision | null {
   if (value === "PRIMARY" || value === "BACKUP" || value === "PASSED") return "PASSED";
-  if (value === "PENDING" || value === "REJECTED") return "REJECTED";
+  if (value === "PENDING") return "PENDING";
+  if (value === "REJECTED") return "REJECTED";
   return null;
 }
 
@@ -84,6 +85,7 @@ export function filterOffer(facts: OfferFacts, config: OfferRuleConfig = DEFAULT
   if (facts.dropship30DayVolume != null && facts.dropship30DayVolume <= 0) risks.push("近期代发量不足");
   if (facts.blindShipping === false) risks.push("不支持淘宝密文代发");
   if (facts.returnShipping === false || facts.noReasonReturn === false) risks.push("售后保障不完整");
+  if (!canBuyOne) risks.push(`无法确认可单件下单（MOQ=${facts.minOrderQuantity ?? "未知"}）`);
   if ((facts.imageCount != null && facts.imageCount < 1) || (facts.skuImageCount != null && facts.skuImageCount < 1) || (facts.detailImageCount != null && facts.detailImageCount < 1)) risks.push("商品素材图片不足");
 
   if (facts.onePieceDelivery === true && (facts.minOrderQuantity === 1 || facts.onePiecePrice != null)) strengths.push("支持一件代发且可以单件购买");
@@ -91,7 +93,7 @@ export function filterOffer(facts: OfferFacts, config: OfferRuleConfig = DEFAULT
   if (facts.dropshipQualityRate != null && facts.dropshipQualityRate >= 95) strengths.push(`代发品质达标率${facts.dropshipQualityRate}%`);
   if (facts.productRating != null && facts.totalReviewCount != null && facts.totalReviewCount >= 30 && (facts.positiveReviewRate ?? 0) >= 95) strengths.push("商品评价样本充分且质量良好");
 
-  const decision: StableSourceDecision = hardFailures.length ? "REJECTED" : "PASSED";
+  const decision: StableSourceDecision = hardFailures.length ? "REJECTED" : missingFields.length ? "PENDING" : "PASSED";
   const dimensions = {
     dropshipping: facts.onePieceDelivery === false || !canBuyOne ? "不合格" : facts.onePieceDelivery == null ? "待确认" : "合格",
     fulfillment: pickup48 == null ? "待确认" : pickup48 < config.pickup48Min ? "不合格" : pickup48 >= 95 ? (facts.pickup24Rate != null && facts.pickup24Rate >= 90 ? "优秀" : "良好") : "风险",
@@ -101,8 +103,8 @@ export function filterOffer(facts: OfferFacts, config: OfferRuleConfig = DEFAULT
     afterSales: facts.returnShipping === true && facts.noReasonReturn === true ? "优秀" : facts.returnShipping == null && facts.noReasonReturn == null ? "待确认" : "风险",
   } satisfies OfferFilterResult["dimensions"];
   return { status: decision === "REJECTED" ? "REJECT" : "PASS", decision,
-    confidence: decision === "REJECTED" ? "高" : "中",
-    hardGate: decision === "REJECTED" ? "不通过" : "通过",
+    confidence: decision === "REJECTED" ? "高" : decision === "PENDING" ? "低" : "中",
+    hardGate: decision === "REJECTED" ? "不通过" : decision === "PENDING" ? "待确认" : "通过",
     dimensions, reasons: [...hardFailures, ...risks], strengths, hardFailures, risks, missingFields };
 }
 

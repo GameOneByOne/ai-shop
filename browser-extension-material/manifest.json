@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "AI 店长淘宝商品素材管理",
+  "version": "0.1.0",
+  "description": "独立负责淘宝草稿读取、商品素材自动填写与内容增强。",
+  "permissions": ["tabs", "scripting", "debugger"],
+  "host_permissions": [
+    "https://*.taobao.com/*",
+    "http://localhost:3000/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["http://localhost:3000/*"],
+      "js": ["bridge.js"],
+      "run_at": "document_start"
+    }
+  ]
+}

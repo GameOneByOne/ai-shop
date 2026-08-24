@@ -7,6 +7,7 @@ import type {
   V3ProductModel,
   V3SourceSku,
 } from "@/lib/sourcing/v3";
+import { DEFAULT_OFFER_RULE_CONFIG } from "@/lib/sourcing/offer-filter";
 type Offer = {
   id: string;
   external_id: string | null;
@@ -38,6 +39,7 @@ type Offer = {
 type Payload = {
   runId: string | null;
   query?: string;
+  aiApplyRules?: boolean | null;
   stats?: { fetched?: number };
   products?: Offer[];
   v3?: SourcingV3Graph;
@@ -50,6 +52,10 @@ type Payload = {
   } | null;
 };
 type OfferAiSelection = {
+  internalCategoryName?: string;
+  standardProductName?: string;
+  categoryParent?: string;
+  categoryChild?: string;
   recommendation: "RECOMMENDED" | "USABLE" | "CAUTIOUS" | "NOT_RECOMMENDED"; confidence: "HIGH" | "MEDIUM" | "LOW";
   dimensions: { dropshipFit: string; supplyStability: string; fulfillmentStability: string; qualityConfidence: string; supplierStability: string };
   directionKey: string; advantages: string[]; risks: string[]; conflicts: string[]; missingEvidence: string[];
@@ -57,6 +63,8 @@ type OfferAiSelection = {
   analyzedAt?: string;
 };
 type ProductRecognition = { productName: string; sellingTitle?: string; mixedSelling: boolean; mixedSellingType: "NONE" | "VARIANT_ONLY" | "ACCESSORY_MIX" | "MULTI_PRODUCT"; categoryParent: string; categoryChild: string; confidence: "HIGH" | "MEDIUM" | "LOW"; evidence: string[]; risks: string[]; analyzedAt?: string };
+const CURRENT_AI_PROMPT_VERSION = "offer-source-evaluation-v6-structured-recognition-evaluation";
+const promptVersionLabel = (value: unknown) => String(value || "未记录").replace("offer-source-evaluation-", "");
 const Icon = ({
   children,
   tone = "purple",
@@ -185,7 +193,9 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
     [imageHashes] = useState<Record<string, string>>({}),
     [rechecking, setRechecking] = useState(false),
     [ruleSelecting, setRuleSelecting] = useState(false),
+    [applyRulesBeforeAi, setApplyRulesBeforeAi] = useState(true),
     [recognizingProducts, setRecognizingProducts] = useState(false),
+    [reparseProgress, setReparseProgress] = useState<{ completed: number; total: number; succeeded: number; failed: number; message: string } | null>(null),
     [message, setMessage] = useState(""),
     [aiProgress, setAiProgress] = useState({ completed: 0, total: 0 }),
     [aiLastRunFailed, setAiLastRunFailed] = useState(false),
@@ -212,6 +222,9 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
   useEffect(() => {
     void refreshData();
   }, [refreshData]);
+  useEffect(() => {
+    if (typeof data?.aiApplyRules === "boolean") setApplyRulesBeforeAi(data.aiApplyRules);
+  }, [data?.aiApplyRules]);
   const graph = data?.v3,
     models = (graph?.models ?? []).filter((x) => x.name.includes(query)),
     model = models[selected] ?? models[0],
@@ -220,6 +233,7 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
     visibleSourceSkus = sourceFilter === "pending" ? pending : allSourceSkus;
   const offers = data?.products ?? [];
   const syncingSelectedRef = useRef(new Set<string>());
+  const aiAbortControllerRef = useRef<AbortController | null>(null);
   useEffect(() => {
     if (!runId) return;
     const missing = offers.filter((offer) => savedSelection(offer) === "PRIMARY" && !offer.candidate_product_id && !syncingSelectedRef.current.has(offer.id));
@@ -241,34 +255,53 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
       }
     })();
   }, [offers, refreshData, runId]);
-  const recognitionCandidates = offers.filter((offer) => ruleDecisionOf(offer) === "PASSED" && savedSelection(offer) !== "REJECTED");
-  const aiCandidates = recognitionCandidates;
+  const ruleWasRun = offers.some((offer) => Boolean(ruleSelectionOf(offer).screenedAt));
+  const hasRestoredCandidates = offers.some((offer) => rawRecord(offer.raw_data.sourcingSelection).ruleOverride === true);
+  const aiPreviouslyRun = offers.some((offer) => Boolean(offerAiSelection(offer)));
+  const aiCandidateScope = !ruleWasRun
+    ? "ALL_WITHOUT_RULES"
+    : hasRestoredCandidates
+      ? "ALL_AFTER_RULE_RESTORE"
+      : "RULE_PASSED_ONLY";
+  const recognitionCandidates = offers.filter((offer) => {
+    if (savedSelection(offer) === "REJECTED") return false;
+    if (aiCandidateScope !== "RULE_PASSED_ONLY") return true;
+    return ruleDecisionOf(offer) === "PASSED";
+  });
+  const allAiCandidates = offers.filter((offer) => savedSelection(offer) !== "REJECTED");
+  const aiCandidates = applyRulesBeforeAi ? recognitionCandidates : allAiCandidates;
+  const incrementalAiCandidates = aiCandidates.filter((offer) => !offerAiSelection(offer));
   const aiSelectionComplete = aiCandidates.length > 0 && aiCandidates.every((offer) => {
     const ai = rawRecord(offer.raw_data.aiSelection), detail = rawRecord(offer.raw_data.detailEnrichment);
     const analyzedAt = Date.parse(String(ai.analyzedAt ?? "")), detailCapturedAt = Date.parse(String(detail.capturedAt ?? ""));
-    return ["offer-source-evaluation-v1", "offer-source-evaluation-v2-combined"].includes(String(ai.promptVersion)) && Boolean(ai.recommendation) && (!Number.isFinite(detailCapturedAt) || (Number.isFinite(analyzedAt) && analyzedAt >= detailCapturedAt));
+    return ["offer-source-evaluation-v1", "offer-source-evaluation-v2-combined", "offer-source-evaluation-v2-internal-category", "offer-source-evaluation-v3-standard-product-name-category", "offer-source-evaluation-v4-detailed-standard-product-name-category", "offer-source-evaluation-v5-hybrid-product-evidence-check", "offer-source-evaluation-v6-structured-recognition-evaluation"].includes(String(ai.promptVersion)) && Boolean(ai.recommendation) && (!Number.isFinite(detailCapturedAt) || (Number.isFinite(analyzedAt) && analyzedAt >= detailCapturedAt));
   });
   const productRecognitionComplete = recognitionCandidates.length > 0 && recognitionCandidates.every((offer) => {
     const recognition = rawRecord(offer.raw_data.productRecognition), detail = rawRecord(offer.raw_data.detailEnrichment);
     const analyzedAt = Date.parse(String(recognition.analyzedAt ?? "")), detailCapturedAt = Date.parse(String(detail.capturedAt ?? ""));
-    return recognition.promptVersion === "offer-combined-recognition-evaluation-v4-evidence-naming" && Array.isArray(recognition.productGroups) && recognition.productGroups.length > 0 && (!Number.isFinite(detailCapturedAt) || (Number.isFinite(analyzedAt) && analyzedAt >= detailCapturedAt));
+    return recognition.promptVersion === "offer-combined-recognition-evaluation-v5-internal-category-only" && Array.isArray(recognition.productGroups) && recognition.productGroups.length > 0 && (!Number.isFinite(detailCapturedAt) || (Number.isFinite(analyzedAt) && analyzedAt >= detailCapturedAt));
   });
   const headerRulePassed = offers.filter((offer) => ruleDecisionOf(offer) === "PASSED").length;
   const headerAiRecommended = offers.filter((offer) => offerAiSelection(offer)?.recommendation === "RECOMMENDED").length;
   const aiAnalyzedCount = offers.filter((offer) => offerAiSelection(offer)).length;
+  const aiPromptVersions = [...new Set(offers.map((offer) => rawRecord(offer.raw_data.aiSelection).promptVersion).filter(Boolean).map(promptVersionLabel))];
   const detailedOffers = offers.filter((offer) => Boolean(offer.raw_data.detailEnrichment)).length;
   const hasPrimary = offers.some((offer) => savedSelection(offer) === "PRIMARY");
   const messageTone = /失败|错误|超时/.test(message) ? "error" : /淘汰|缺失|严格/.test(message) ? "warning" : "success";
   const elapsedSeconds = operationClock ? Math.max(0, Math.floor(((operationClock.endedAt ?? clockNow) - operationClock.startedAt) / 1000)) : 0;
-  const activePhaseLabel = ruleSelecting ? "解析与规则" : recognizingProducts ? "AI货源选择" : rechecking ? "解析与规则" : "";
+  const activePhaseLabel = ruleSelecting ? "规则筛选" : recognizingProducts ? "AI货源选择" : rechecking ? "解析货源" : "";
   const aiStageComplete = aiSelectionComplete;
-  const parseAndRuleComplete = offers.length > 0 && detailedOffers === offers.length && offers.every((offer) => Boolean(ruleSelectionOf(offer).screenedAt));
+  const parseComplete = offers.length > 0 && detailedOffers === offers.length;
+  const ruleComplete = offers.length > 0 && offers.every((offer) => Boolean(ruleSelectionOf(offer).screenedAt));
+  const parseAndRuleComplete = parseComplete && ruleComplete;
   const pipelineSteps = [
     { label: "搜索货源", done: offers.length > 0, active: false, detail: offers.length ? `${offers.length} 条` : "待运行" },
-    { label: "解析与规则", done: parseAndRuleComplete, active: (operationClock?.phase === "ENRICH" && !operationClock.endedAt) || ruleSelecting || rechecking, detail: parseAndRuleComplete ? `${headerRulePassed} 条通过` : `${detailedOffers}/${offers.length} 已解析` },
-    { label: "AI货源选择", done: aiStageComplete, active: recognizingProducts, detail: recognizingProducts ? "一次评估中" : aiStageComplete ? `${aiAnalyzedCount} 条完成` : "待运行" },
+    { label: "解析货源", done: parseComplete, active: (operationClock?.phase === "ENRICH" && !operationClock.endedAt) || rechecking, detail: rechecking && reparseProgress ? `正在补全 ${reparseProgress.completed}/${reparseProgress.total}` : detailedOffers === 0 ? "未执行" : `${detailedOffers}/${offers.length} 详情已获取` },
+    { label: "规则筛选", done: ruleComplete, active: ruleSelecting, detail: ruleSelecting ? "正在执行" : ruleComplete ? `${headerRulePassed} 条通过` : parseComplete ? "待运行" : "等待解析" },
+    { label: "AI货源选择", done: aiStageComplete, active: recognizingProducts, detail: recognizingProducts ? `逐条评估 ${aiProgress.completed}/${aiProgress.total}` : aiStageComplete ? `${aiAnalyzedCount} 条完成` : "待运行" },
     { label: "选择主货源", done: hasPrimary, active: aiStageComplete && !hasPrimary, detail: hasPrimary ? "已完成" : aiStageComplete ? "等待选择" : "待运行" },
   ];
+  const completedPipelineSteps = pipelineSteps.filter((step) => step.done).length;
   const supplierCount = new Set(
     offers.map((offer) => offer.supplier_name).filter(Boolean),
   ).size;
@@ -354,7 +387,8 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
       if (responseText) try { body = JSON.parse(responseText) as Record<string, unknown>; } catch { body = {}; }
       if (!response.ok) throw new Error(typeof body.error === "string" ? body.error : responseText || `规则初筛失败（HTTP ${response.status}）`);
       await refreshData();
-      setMessage(responseText ? `规则初筛完成：通过 ${body.passed ?? 0}，规则淘汰 ${body.rejected ?? 0}${body.preserved ? `；保留 ${body.preserved} 个人工选择` : ""}。` : "规则初筛已执行并刷新结果；服务未返回统计信息。");
+      setMessage(responseText ? `规则初筛完成：通过 ${body.passed ?? 0}，待补数据 ${body.pending ?? 0}，规则淘汰 ${body.rejected ?? 0}${body.preserved ? `；保留 ${body.preserved} 个人工选择` : ""}。` : "规则初筛已执行并刷新结果；服务未返回统计信息。");
+      return body;
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "规则初筛失败");
     } finally { setRuleSelecting(false); setOperationClock((current) => current?.phase === "RULE" ? { ...current, endedAt: Date.now() } : current); }
@@ -402,7 +436,8 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
   }
   async function retryFailedOfferDetails(targetOffer?: Offer) {
     if (!data?.runId || rechecking) return;
-    const failedOffers = offers.filter(reparseRequired);
+    const activeRunId = data.runId;
+    const failedOffers = offers.filter(actionableReparseRequired);
     const offersToRetry = targetOffer ? [targetOffer] : failedOffers;
     if (!offersToRetry.length) {
       setMessage("当前没有关键规则数据缺失的货源。");
@@ -410,9 +445,12 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
     }
     const requestId = crypto.randomUUID();
     setRechecking(true); setOperationClock({ phase: "ENRICH", startedAt: Date.now() });
+    setReparseProgress({ completed: 0, total: offersToRetry.length, succeeded: 0, failed: 0, message: "正在准备重新解析…" });
     setMessage(`正在重新解析 ${offersToRetry.length} 个失败项…`);
     try {
-      const result = await new Promise<{ details?: unknown[]; failures?: Array<{ error?: string }>; error?: string }>((resolve, reject) => {
+      let saveError: Error | null = null;
+      let saveQueue = Promise.resolve();
+      const result = await new Promise<{ details?: unknown[]; checkpointedCount?: number; failures?: Array<{ error?: string }>; error?: string }>((resolve, reject) => {
         const timeout = window.setTimeout(() => {
           window.removeEventListener("message", receive);
           reject(new Error("失败项重新解析超时，请检查1688登录状态"));
@@ -420,7 +458,31 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
         function receive(event: MessageEvent) {
           if (event.origin !== location.origin || event.data?.requestId !== requestId) return;
           if (event.data?.type === "AI_SHOP_CAPTURE_PROGRESS") {
-            setMessage(event.data.message || `正在重新解析 ${offersToRetry.length} 个失败项…`);
+            const progressMessage = event.data.message || `正在重新解析 ${offersToRetry.length} 个失败项…`;
+            setMessage(progressMessage);
+            setReparseProgress({
+              completed: Number(event.data.completed ?? 0),
+              total: Number(event.data.total ?? offersToRetry.length),
+              succeeded: Number(event.data.succeeded ?? 0),
+              failed: Number(event.data.failed ?? 0),
+              message: progressMessage,
+            });
+            return;
+          }
+          if (event.data?.type === "AI_SHOP_CAPTURE_CHECKPOINT") {
+            const batch = Array.isArray(event.data.details) ? event.data.details : [];
+            if (!batch.length) return;
+            saveQueue = saveQueue.then(async () => {
+              const response = await fetch("/api/sourcing/enrich", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ runId: activeRunId, details: batch, checkpoint: true }),
+              });
+              const body = await response.json();
+              if (!response.ok) throw new Error(body.error ?? "保存重新解析批次失败");
+            }).catch((error: unknown) => {
+              saveError = error instanceof Error ? error : new Error("保存重新解析批次失败");
+            });
             return;
           }
           if (event.data?.type !== "AI_SHOP_CAPTURE_RESULT") return;
@@ -438,41 +500,85 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
         }, location.origin);
       });
       if (result.error) throw new Error(result.error);
+      await saveQueue;
+      if (saveError) throw saveError;
       if (result.details?.length) {
         const response = await fetch("/api/sourcing/enrich", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ runId: data.runId, details: result.details }),
+          body: JSON.stringify({ runId: activeRunId, details: result.details }),
         });
         const body = await response.json();
         if (!response.ok) throw new Error(body.error ?? "保存重新解析结果失败");
       }
-      const screened = await fetch("/api/sourcing/rule-selection", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId: data.runId }) });
+      const screened = await fetch("/api/sourcing/rule-selection", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId: activeRunId }) });
       const screening = await screened.json();
       if (!screened.ok) throw new Error(screening.error ?? "重新执行规则初筛失败");
       await refreshData();
-      const succeeded = result.details?.length ?? 0, failed = result.failures?.length ?? 0;
+      const succeeded = result.checkpointedCount ?? result.details?.length ?? 0, failed = result.failures?.length ?? 0;
       setMessage(`重新解析完成：成功补全 ${succeeded} 个，仍然缺失 ${failed} 个，重新判断为通过 ${screening.passed ?? 0} 个，因不符合规则继续淘汰 ${screening.rejected ?? 0} 个。`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "失败项重新解析失败");
     } finally {
-      setRechecking(false); setOperationClock((current) => current?.phase === "ENRICH" ? { ...current, endedAt: Date.now() } : current);
+      setRechecking(false); setReparseProgress(null); setOperationClock((current) => current?.phase === "ENRICH" ? { ...current, endedAt: Date.now() } : current);
     }
   }
   async function runAiOfferSelection() {
     if (!data?.runId || recognizingProducts) return;
-    setRecognizingProducts(true); setOperationClock({ phase: "AI", startedAt: Date.now() }); setMessage("AI正在一次评估全部候选货源，不生成上架文案或素材…");
-    try {
-      const response = await fetch("/api/sourcing/ai-selection", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId: data.runId }) });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.error ?? "AI货源选择失败");
-      await refreshData();
-      setMessage(`AI货源选择完成：已评估 ${Array.isArray(body.results) ? body.results.length : 0} 个候选。商品文案与素材将在铺货后读取淘宝草稿再生成。`);
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "AI货源选择失败");
-    } finally {
-      setRecognizingProducts(false); setOperationClock((current) => current?.phase === "AI" ? { ...current, endedAt: Date.now() } : current);
+    let ruleSkippedCount = 0;
+    let scopedCandidates = offers.filter((offer) => savedSelection(offer) !== "REJECTED");
+    if (applyRulesBeforeAi) {
+      const screening = await runRuleSelection();
+      if (!screening) return;
+      const passedIds = new Set(Array.isArray(screening.passedOfferIds) ? screening.passedOfferIds.map(String) : []);
+      scopedCandidates = scopedCandidates.filter((offer) => passedIds.has(offer.id) || rawRecord(offer.raw_data.sourcingSelection).ruleOverride === true);
+      ruleSkippedCount = Number(screening.rejected ?? 0);
     }
+    const incremental = scopedCandidates.filter((offer) => !offerAiSelection(offer));
+    const candidates = incremental.length ? incremental : scopedCandidates;
+    const force = incremental.length === 0 && candidates.some((offer) => Boolean(offerAiSelection(offer)));
+    const modeLabel = incremental.length ? (aiPreviouslyRun ? "增量AI选择" : "AI选择") : "重新AI选择";
+    if (!candidates.length) { setMessage(applyRulesBeforeAi ? `规则筛选完成：${ruleSkippedCount} 条未通过并已记录，当前没有可进入AI评估的货源。` : "当前没有可评估的货源。"); return; }
+    if (force && !window.confirm(`将重新调用 AI，并覆盖本轮 ${candidates.length} 条货源当前保存的标准商品名、商品分类和货源判断。人工选择与人工淘汰不会改变。是否继续？`)) return;
+    const controller = new AbortController();
+    aiAbortControllerRef.current = controller;
+    const scopeLabel = applyRulesBeforeAi ? `规则通过范围${ruleSkippedCount ? `（${ruleSkippedCount} 条规则未通过已记录）` : ""}` : "跳过规则的全量范围";
+    setRecognizingProducts(true); setAiProgress({ completed: 0, total: candidates.length }); setAiLastRunFailed(false); setAiLastRunSucceeded(false); setOperationClock({ phase: "AI", startedAt: Date.now() }); setMessage(`${modeLabel}：将在${scopeLabel}内逐条评估 ${candidates.length} 个货源，Prompt ${promptVersionLabel(CURRENT_AI_PROMPT_VERSION)}…`);
+    try {
+      const results: Array<Record<string, unknown>> = [];
+      const failures: string[] = [];
+      for (let index = 0; index < candidates.length; index += 1) {
+        const offer = candidates[index];
+        setMessage(`正在逐条评估 ${index + 1}/${candidates.length}：${offer.title}`);
+        let completed = false;
+        for (let attempt = 1; attempt <= 2 && !completed; attempt += 1) {
+          const response = await fetch("/api/sourcing/ai-selection", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId: data.runId, offerIds: [offer.id], force, applyRules: applyRulesBeforeAi }), signal: controller.signal });
+          const responseText = await response.text();
+          let body: Record<string, unknown> = {};
+          if (responseText) try { body = JSON.parse(responseText) as Record<string, unknown>; } catch { body = { error: responseText }; }
+          if (response.ok && Array.isArray(body.results) && body.results.length === 1) {
+            results.push(...body.results); completed = true; break;
+          }
+          const reason = body.error ?? (response.ok ? `返回 ${Array.isArray(body.results) ? body.results.length : 0}/1 条` : "AI货源选择失败");
+          if (attempt === 1) setMessage(`第 ${index + 1}/${candidates.length} 条返回异常，正在重试…`);
+          else failures.push(`第 ${index + 1} 条：${reason}`);
+        }
+        setAiProgress({ completed: index + 1, total: candidates.length });
+      }
+      await refreshData();
+      setAiLastRunFailed(failures.length > 0); setAiLastRunSucceeded(failures.length === 0);
+      const approvableCount = results.filter((item) => ["RECOMMENDED", "USABLE"].includes(String(item.recommendation ?? ""))).length;
+      setMessage(failures.length ? `AI逐条评估完成：成功 ${results.length} 条，失败 ${failures.length} 条；可再次运行补齐失败项。${failures.slice(0, 2).join("；")}` : `AI货源选择完成：已逐条评估 ${results.length} 个候选，其中 ${approvableCount} 条为推荐或可用；请人工确认后批量审批。`);
+    } catch (error) {
+      setAiLastRunFailed(!(error instanceof DOMException && error.name === "AbortError"));
+      setMessage(error instanceof DOMException && error.name === "AbortError" ? "已取消 AI 货源选择。" : error instanceof Error ? error.message : "AI货源选择失败");
+    } finally {
+      aiAbortControllerRef.current = null; setRecognizingProducts(false); setOperationClock((current) => current?.phase === "AI" ? { ...current, endedAt: Date.now() } : current);
+    }
+  }
+  function cancelAiOfferSelection() {
+    aiAbortControllerRef.current?.abort();
+    setMessage("正在取消 AI 货源选择…");
   }
   function retryOfferDetail(offer: Offer) {
     return retryFailedOfferDetails(offer);
@@ -500,19 +606,27 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
         <header className="v2-page-head">
           <div>
             <h1>{data?.query || "货源搜索结果"}</h1>
-            <p>{offers.length} 条结果 · 规则通过 {headerRulePassed} · AI 推荐 {headerAiRecommended}</p>
+            <p>{offers.length} 条结果 · 规则通过 {headerRulePassed} · AI已评估 {aiAnalyzedCount} · AI推荐 {headerAiRecommended} · Prompt {aiPromptVersions.length ? aiPromptVersions.join(" / ") : promptVersionLabel(CURRENT_AI_PROMPT_VERSION)}</p>
           </div>
           <div className="v2-actions sourcing-page-actions">
-            <Link className="v2-primary" href="/products/discover/search">新建货源搜索</Link>
-            {!parseAndRuleComplete && <button className="v2-primary" disabled={ruleSelecting || rechecking} onClick={() => detailedOffers < offers.length ? void retryFailedOfferDetails() : void runRuleSelection()}>{rechecking ? "解析中…" : ruleSelecting ? "规则筛选中…" : detailedOffers < offers.length ? "继续解析货源" : "执行规则筛选"}</button>}
-            {parseAndRuleComplete && !aiStageComplete && <button className="v2-primary" disabled={recognizingProducts || !recognitionCandidates.length} onClick={() => void runAiOfferSelection()}>{recognizingProducts ? "AI货源评估中…" : "AI选择货源"}</button>}
-            {hasPrimary && <Link className="v2-primary" href="/products/manage">进入商品管理</Link>}
-            <details className="sourcing-more-actions"><summary>更多操作</summary><div><button type="button" onClick={() => window.dispatchEvent(new Event("open-sourcing-rule-editor"))}>编辑规则</button><button type="button" disabled={ruleSelecting} onClick={() => void runRuleSelection()}>重新运行规则</button><button type="button" disabled={rechecking || !offers.some(reparseRequired)} onClick={() => void retryFailedOfferDetails()}>重新解析缺失项</button><Link href="/products/discover">返回任务列表</Link></div></details>
+            <div className="sourcing-primary-actions sourcing-flow-actions">
+              <button type="button" className="v2-primary" disabled={rechecking || !offers.some(actionableReparseRequired)} onClick={() => void retryFailedOfferDetails()}>{rechecking ? "解析中…" : "重新解析缺失项"}</button>
+              <button type="button" className="v2-primary" onClick={() => window.dispatchEvent(new Event("open-sourcing-rule-editor"))}>编辑规则</button>
+              {recognizingProducts && <button className="v2-danger-btn" onClick={cancelAiOfferSelection}>取消AI选择</button>}
+              {!recognizingProducts && <label className="sourcing-ai-rule-branch"><span>AI选择前</span><select value={applyRulesBeforeAi ? "APPLY" : "SKIP"} onChange={(event) => setApplyRulesBeforeAi(event.target.value === "APPLY")}><option value="APPLY">应用规则</option><option value="SKIP">不应用规则</option></select></label>}
+              {!recognizingProducts && <button className="v2-primary" title={!parseComplete ? `还有 ${offers.length - detailedOffers} 条货源详情未解析，完成后才能运行AI` : undefined} disabled={!parseComplete || ruleSelecting || rechecking || !offers.length} onClick={() => void runAiOfferSelection()}>{!parseComplete ? "AI选择货源（需先完成解析）" : ruleSelecting ? "规则筛选中…" : incrementalAiCandidates.length ? "AI选择货源" : aiPreviouslyRun ? "重新AI选择货源" : "AI选择货源"}</button>}
+              {hasPrimary && <Link className="v2-primary" href="/products/manage">进入商品管理</Link>}
+              <Link className="v2-primary sourcing-new-search-link" href="/products/discover/search">新建货源搜索</Link>
+            </div>
+            <div className="sourcing-maintenance-actions" aria-label="本轮维护操作">
+              <Link className="sourcing-back-link" href="/products/discover">返回任务列表</Link>
+            </div>
           </div>
         </header>
-        <section className="sourcing-pipeline-progress" aria-label="货源处理进度">
-          <div className="pipeline-progress-head"><div><b>{activePhaseLabel ? `正在${activePhaseLabel}` : pipelineSteps.every((step) => step.done) ? "本轮处理已完成" : "货源处理进度"}</b><span>{operationClock ? `${operationClock.endedAt ? "本次耗时" : "已运行"} ${formatDuration(elapsedSeconds)}` : "完成当前步骤后自动保留结果"}</span></div><strong>{Math.round((pipelineSteps.filter((step) => step.done).length / pipelineSteps.length) * 100)}%</strong></div>
-          <div className="pipeline-step-track">{pipelineSteps.map((step, index) => <div key={step.label} className={`${step.done ? "done" : ""}${step.active ? " active" : ""}`}><i>{step.done ? "✓" : index + 1}</i><span><b>{step.label}</b><small>{step.detail}</small></span></div>)}</div>
+        <section className="card product-work-card sourcing-pipeline-progress" aria-label="货源处理进度">
+          <div className="proposal-head pipeline-progress-head"><div className="product-work-copy"><span className="eyebrow">进度管理</span><h2>{activePhaseLabel ? `正在${activePhaseLabel}` : completedPipelineSteps === pipelineSteps.length ? "本轮处理已完成" : "货源处理进度"}</h2><p className="muted">{operationClock ? `${operationClock.endedAt ? "本次耗时" : "已运行"} ${formatDuration(elapsedSeconds)}` : "完成当前步骤后自动保留结果"}</p></div></div>
+          <div className="candidate-facts pipeline-step-track">{pipelineSteps.map((step, index) => <div key={step.label} className={`${step.done ? "done" : ""}${step.active ? " active" : ""}`}><i>{step.active ? "↻" : step.done ? "✓" : index + 1}</i><span><b>{step.label}</b><small>{step.detail}</small></span></div>)}</div>
+          {reparseProgress && <div className="reparse-live-progress" aria-live="polite"><div><span>{reparseProgress.message}</span><b>{reparseProgress.completed} / {reparseProgress.total} · 成功 {reparseProgress.succeeded} · 失败 {reparseProgress.failed}</b></div><div className="reparse-progress-track"><i style={{ width: `${reparseProgress.total ? Math.min(100, Math.round(reparseProgress.completed / reparseProgress.total * 100)) : 0}%` }} /></div></div>}
         </section>
         {aiStageComplete && <div className="ai-run-summary"><div><b>第一阶段 AI 货源选择已完成</b><span>已评估 {aiAnalyzedCount} 个候选；本阶段不会生成或修改淘宝商品内容。</span></div></div>}
         {message && <div className={`status-box ${messageTone}`}>{message}</div>}
@@ -520,7 +634,7 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
           <div className="status-box">正在加载本轮货源…</div>
         ) : offers.length ? (
           <section className="v2-card sourcing-result-workspace">
-            <OfferTable offers={offers} runId={data?.runId ?? runId} onRefresh={refreshData} onRetryOffer={retryOfferDetail} rechecking={rechecking} />
+            <OfferTable offers={offers} runId={data?.runId ?? runId} onRefresh={refreshData} onRetryOffer={retryOfferDetail} rechecking={rechecking} rulesAppliedToAi={applyRulesBeforeAi} />
           </section>
         ) : (
           <div className="v2-card v2-empty">
@@ -699,7 +813,7 @@ export function RealDiscoveryWorkspace({ runId }: { runId?: string } = {}) {
       )}
       {tab === "offers" && (
         <section className="v2-card table-card">
-          <OfferTable offers={offers} runId={data?.runId ?? null} onRefresh={refreshData} onRetryOffer={retryOfferDetail} rechecking={rechecking} />
+          <OfferTable offers={offers} runId={data?.runId ?? null} onRefresh={refreshData} onRetryOffer={retryOfferDetail} rechecking={rechecking} rulesAppliedToAi={applyRulesBeforeAi} />
         </section>
       )}
       {!data?.runId && (
@@ -1153,21 +1267,23 @@ function rawRecord(value: unknown) {
 function stringArray(value: unknown) { return Array.isArray(value) ? value.map(String) : []; }
 function offerAiSelection(offer: Offer): OfferAiSelection | null {
   const value = rawRecord(offer.raw_data.aiSelection);
-  if (!["offer-source-evaluation-v1", "offer-source-evaluation-v2-combined"].includes(String(value.promptVersion)) || !value.recommendation || !value.dimensions) return null;
+  if (!["offer-source-evaluation-v1", "offer-source-evaluation-v2-combined", "offer-source-evaluation-v2-internal-category", "offer-source-evaluation-v3-standard-product-name-category", "offer-source-evaluation-v4-detailed-standard-product-name-category", "offer-source-evaluation-v5-hybrid-product-evidence-check", "offer-source-evaluation-v6-structured-recognition-evaluation"].includes(String(value.promptVersion)) || !value.recommendation || !value.dimensions) return null;
   return value as unknown as OfferAiSelection;
 }
 function productRecognitionOf(offer: Offer): ProductRecognition | null {
   const value = rawRecord(offer.raw_data.productRecognition);
-  return ["offer-combined-recognition-evaluation-v1", "offer-combined-recognition-evaluation-v2-selling-name", "offer-combined-recognition-evaluation-v3-standard-selling-title", "offer-combined-recognition-evaluation-v4-evidence-naming"].includes(String(value.promptVersion)) && Array.isArray(value.productGroups) && value.productGroups.length > 0 && value.productName && value.categoryChild ? value as unknown as ProductRecognition : null;
+  return ["offer-combined-recognition-evaluation-v1", "offer-combined-recognition-evaluation-v2-selling-name", "offer-combined-recognition-evaluation-v3-standard-selling-title", "offer-combined-recognition-evaluation-v4-evidence-naming", "offer-combined-recognition-evaluation-v5-internal-category-only"].includes(String(value.promptVersion)) && Array.isArray(value.productGroups) && value.productGroups.length > 0 && value.productName && value.categoryChild ? value as unknown as ProductRecognition : null;
 }
 function aiRecommendationLabel(value: OfferAiSelection["recommendation"]) {
   return value === "RECOMMENDED" ? "推荐" : value === "USABLE" ? "可用" : value === "CAUTIOUS" ? "谨慎" : "不推荐";
 }
 function ruleSelectionOf(offer: Offer) { return rawRecord(offer.raw_data.ruleSelection); }
 function ruleDecisionOf(offer: Offer) {
-  if (rawRecord(offer.raw_data.sourcingSelection).ruleOverride === true) return "PASSED";
   const value = String(ruleSelectionOf(offer).decision ?? "");
   return value === "PRIMARY" || value === "BACKUP" ? "PASSED" : value;
+}
+function ruleEligibleForAi(offer: Offer) {
+  return ruleDecisionOf(offer) !== "REJECTED" || rawRecord(offer.raw_data.sourcingSelection).ruleOverride === true;
 }
 function offerFactsOf(offer: Offer) {
   return rawRecord(offer.raw_data.offerFacts);
@@ -1239,7 +1355,8 @@ function detailCompletenessIssues(offer: Offer) {
 }
 const detailParseFailed = (offer: Offer) => detailCompletenessIssues(offer).length > 0;
 const reparseRequired = (offer: Offer) => detailParseFailed(offer) || stringArray(ruleSelectionOf(offer).missingFields).length > 0;
-function OfferTable({ offers, runId, onRefresh, onRetryOffer, rechecking }: { offers: Offer[]; runId: string | null; onRefresh: () => Promise<void>; onRetryOffer: (offer: Offer) => Promise<void>; rechecking: boolean }) {
+const actionableReparseRequired = (offer: Offer) => savedSelection(offer) !== "REJECTED" && reparseRequired(offer);
+function OfferTable({ offers, runId, onRefresh, onRetryOffer, rechecking, rulesAppliedToAi }: { offers: Offer[]; runId: string | null; onRefresh: () => Promise<void>; onRetryOffer: (offer: Offer) => Promise<void>; rechecking: boolean; rulesAppliedToAi: boolean }) {
   const [status, setStatus] = useState<OfferFilter>("ALL"),
     [selectedId, setSelectedId] = useState<string | null>(null),
     [detailTab, setDetailTab] = useState<"SKU" | "PRODUCT" | "SUPPLIER" | "DROPSHIP" | "FULFILLMENT" | "AI">("SKU"),
@@ -1247,16 +1364,22 @@ function OfferTable({ offers, runId, onRefresh, onRetryOffer, rechecking }: { of
     [actionError, setActionError] = useState(""),
     [showRuleEditor, setShowRuleEditor] = useState(false),
     [savingRules, setSavingRules] = useState(false),
-    [ruleConfig, setRuleConfig] = useState({ requireOnePiece:true, require1688Selection:false, requireReturnShipping:false, requireNoReasonReturn:false, rejectNoSellableSku:true, requireSingleOrder:true, rejectInvalidProduct:true, rejectMissingCriticalData:false, pickup48Min:70, qualityMin:70, reviewCountMin:0, productFavoriteMin:0, positiveReviewMin:0 }),
+    [batchApproving, setBatchApproving] = useState(false),
+    [batchApprovalMessage, setBatchApprovalMessage] = useState(""),
+    [ruleConfig, setRuleConfig] = useState({ ...DEFAULT_OFFER_RULE_CONFIG }),
     [productLinks, setProductLinks] = useState<Record<string, string>>({}),
     [selections, setSelections] = useState<Record<string, OfferSelection>>({});
   const stateOf = (offer: Offer) => selections[offer.id] ?? savedSelection(offer);
   const isRuleRejected = (offer: Offer) => ruleDecisionOf(offer) === "REJECTED";
   const isManualRejected = (offer: Offer) => stateOf(offer) === "REJECTED";
   const isRulePassed = (offer: Offer) => ruleDecisionOf(offer) === "PASSED";
-  const isDataPending = (offer: Offer) => ruleDecisionOf(offer) !== "REJECTED" && reparseRequired(offer);
+  const isDataPending = reparseRequired;
   const isAiRecommended = (offer: Offer) => offerAiSelection(offer)?.recommendation === "RECOMMENDED";
-  const isUndecided = (offer: Offer) => isRulePassed(offer) && stateOf(offer) === "CANDIDATE";
+  const isUndecided = (offer: Offer) =>
+    (!rulesAppliedToAi || ruleEligibleForAi(offer)) &&
+    !isDataPending(offer) &&
+    Boolean(offerAiSelection(offer)) &&
+    stateOf(offer) === "CANDIDATE";
   const rows = offers.filter((offer) => {
       if (status === "RULE_REJECTED") return isRuleRejected(offer);
       if (status === "MANUAL_REJECTED") return isManualRejected(offer);
@@ -1274,9 +1397,31 @@ function OfferTable({ offers, runId, onRefresh, onRetryOffer, rechecking }: { of
     aiRecommendedCount = offers.filter(isAiRecommended).length,
     undecidedCount = offers.filter(isUndecided).length,
     manualRejectedCount = offers.filter(isManualRejected).length,
-    aiSelectableOffers = offers.filter((offer) => isRulePassed(offer) && stateOf(offer) === "CANDIDATE" && ["RECOMMENDED", "USABLE"].includes(offerAiSelection(offer)?.recommendation ?? "")),
     rejectionRate = offers.length ? Math.round(ruleRejectedCount / offers.length * 100) : 0;
   const selected = offers.find((offer) => offer.id === selectedId) ?? null;
+  const batchApprovalOffers = offers.filter((offer) => {
+    const recommendation = offerAiSelection(offer)?.recommendation;
+    return ["RECOMMENDED", "USABLE"].includes(String(recommendation ?? "")) && !["PRIMARY", "BACKUP"].includes(stateOf(offer));
+  });
+  async function approveAiSelections() {
+    if (!runId || batchApproving || !batchApprovalOffers.length) return;
+    if (!window.confirm(`确认选择 AI 判断为“推荐”或“可用”的 ${batchApprovalOffers.length} 条货源？`)) return;
+    setBatchApproving(true); setActionError(""); setBatchApprovalMessage("");
+    try {
+      let completed = 0;
+      for (const offer of batchApprovalOffers) {
+        const response = await fetch("/api/sourcing/offer-selection", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId, offerId: offer.id, status: "PRIMARY" }) });
+        const body = await response.json();
+        if (!response.ok) throw new Error(`已审批 ${completed}/${batchApprovalOffers.length} 条；${body.error ?? `货源 ${offer.external_id ?? offer.id} 审批失败`}`);
+        completed += 1;
+      }
+      await onRefresh();
+      setBatchApprovalMessage(`人工批量审批完成：已选择 ${completed} 条 AI 推荐或可用货源。`);
+    } catch (error) {
+      await onRefresh();
+      setActionError(error instanceof Error ? error.message : "人工批量审批失败");
+    } finally { setBatchApproving(false); }
+  }
   async function openRuleEditor() {
     if (!runId) return;
     setShowRuleEditor(true); setActionError("");
@@ -1340,39 +1485,6 @@ function OfferTable({ offers, runId, onRefresh, onRetryOffer, rechecking }: { of
     } catch (error) { setActionError(error instanceof Error ? error.message : "保存失败"); }
     finally { setSaving(false); }
   }
-  async function restoreRuleRejected() {
-    const targets = offers.filter((offer) => isRuleRejected(offer) && !isManualRejected(offer));
-    if (!runId || !targets.length || saving || !window.confirm(`确认恢复 ${targets.length} 条规则淘汰货源为候选？恢复后可重新运行 AI 分析。`)) return;
-    setSaving(true); setActionError("");
-    try {
-      for (const offer of targets) {
-        const response = await fetch("/api/sourcing/offer-selection", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId, offerId: offer.id, status: "CANDIDATE" }) });
-        const body = await response.json();
-        if (!response.ok) throw new Error(body.error ?? `恢复 ${offer.external_id ?? offer.id} 失败`);
-      }
-      await onRefresh();
-      setSelections((current) => ({ ...current, ...Object.fromEntries(targets.map((offer) => [offer.id, "CANDIDATE" as const])) }));
-      setActionError(`已恢复 ${targets.length} 条货源；可点击顶部“重新运行AI分析”。`);
-    } catch (error) { setActionError(error instanceof Error ? error.message : "批量恢复失败"); }
-    finally { setSaving(false); }
-  }
-  async function confirmAiSelectableOffers() {
-    if (!runId || !aiSelectableOffers.length || saving || !window.confirm(`确认选择 ${aiSelectableOffers.length} 条 AI“推荐”或“可用”货源？`)) return;
-    setSaving(true); setActionError("");
-    let completed = 0;
-    try {
-      for (const offer of aiSelectableOffers) {
-        const response = await fetch("/api/sourcing/offer-selection", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId, offerId: offer.id, status: "PRIMARY" }) });
-        const body = await response.json();
-        if (!response.ok) throw new Error(body.error ?? `选择 ${offer.external_id ?? offer.id} 失败`);
-        completed += 1;
-      }
-      setSelections((current) => ({ ...current, ...Object.fromEntries(aiSelectableOffers.map((offer) => [offer.id, "PRIMARY" as const])) }));
-      await onRefresh();
-      setActionError(`已选择 ${completed} 条 AI 推荐或可用货源。`);
-    } catch (error) { setActionError(`${error instanceof Error ? error.message : "批量选择失败"}；已完成 ${completed}/${aiSelectableOffers.length} 条。`); }
-    finally { setSaving(false); }
-  }
   return (
     <>
       <div className="v2-filter-group offer-status-tabs">
@@ -1382,22 +1494,22 @@ function OfferTable({ offers, runId, onRefresh, onRetryOffer, rechecking }: { of
             className={status === value ? "v2-primary" : "v2-secondary"}
             onClick={() => setStatus(value)}
           >
-            {value === "ALL" ? `全部 ${offers.length}` : value === "RULE_PASSED" ? `规则通过 ${rulePassedCount}` : value === "DATA_PENDING" ? `待补数据 ${dataPendingCount}` : value === "RULE_REJECTED" ? `规则淘汰 ${ruleRejectedCount}` : value === "AI_RECOMMENDED" ? `AI推荐 ${aiRecommendedCount}` : value === "UNDECIDED" ? `待人工决定 ${undecidedCount}` : value === "SELECTED" ? `已选择 ${selectedCount}` : `人工淘汰 ${manualRejectedCount}`}
+            {value === "ALL" ? `全部 ${offers.length}` : value === "RULE_PASSED" ? `规则通过 ${rulePassedCount}` : value === "DATA_PENDING" ? `待补数据 ${dataPendingCount}` : value === "RULE_REJECTED" ? `${rulesAppliedToAi ? "规则淘汰" : "历史规则未通过"} ${ruleRejectedCount}` : value === "AI_RECOMMENDED" ? `AI推荐 ${aiRecommendedCount}` : value === "UNDECIDED" ? `待人工决定 ${undecidedCount}` : value === "SELECTED" ? `已选择 ${selectedCount}` : `人工淘汰 ${manualRejectedCount}`}
           </button>
         ))}
-        <button className="batch-ai-confirm" type="button" disabled={saving || !aiSelectableOffers.length} onClick={() => void confirmAiSelectableOffers()}>一键确认AI推荐与可用 ({aiSelectableOffers.length})</button>
+        <button type="button" className="v2-primary batch-ai-approve" disabled={batchApproving || !batchApprovalOffers.length} onClick={() => void approveAiSelections()}>{batchApproving ? "审批中…" : `人工批量审批 ${batchApprovalOffers.length}`}</button>
       </div>
-      {rejectionRate >= 60 && <div className="rule-strictness-warning"><div><b>当前规则可能过严</b><span>{rejectionRate}% 的货源未通过规则。建议检查“1688严选、评价数、售后保障”是否需要作为硬门槛。</span></div><div className="warning-actions"><button type="button" onClick={() => void openRuleEditor()}>检查规则</button><button type="button" disabled={saving} onClick={() => void restoreRuleRejected()}>批量恢复</button></div></div>}
-      {showRuleEditor && <section className="v2-card" style={{marginBottom:16}}><div className="proposal-head"><div><h3>规则淘汰设置</h3><p>不考虑价格、运费、包邮、优惠券或折扣。保存后点击“规则初筛”生效。</p></div><button type="button" className="drawer-close" onClick={() => setShowRuleEditor(false)}>×</button></div><div className="form-grid"><label><input type="checkbox" checked={ruleConfig.requireOnePiece} onChange={(event) => setRuleConfig({...ruleConfig,requireOnePiece:event.target.checked})} /> 要求支持一件代发</label><label><input type="checkbox" checked={ruleConfig.require1688Selection} onChange={(event) => setRuleConfig({...ruleConfig,require1688Selection:event.target.checked})} /> 要求为1688严选商品</label><label><input type="checkbox" checked={ruleConfig.requireReturnShipping} onChange={(event) => setRuleConfig({...ruleConfig,requireReturnShipping:event.target.checked})} /> 要求支持退货包运费</label><label><input type="checkbox" checked={ruleConfig.requireNoReasonReturn} onChange={(event) => setRuleConfig({...ruleConfig,requireNoReasonReturn:event.target.checked})} /> 要求支持7天无理由退货</label><label><input type="checkbox" checked={ruleConfig.rejectNoSellableSku} onChange={(event) => setRuleConfig({...ruleConfig,rejectNoSellableSku:event.target.checked})} /> 已知SKU全部无货时淘汰</label><label><input type="checkbox" checked={ruleConfig.requireSingleOrder} onChange={(event) => setRuleConfig({...ruleConfig,requireSingleOrder:event.target.checked})} /> 要求可以单件下单</label><label><input type="checkbox" checked={ruleConfig.rejectInvalidProduct} onChange={(event) => setRuleConfig({...ruleConfig,rejectInvalidProduct:event.target.checked})} /> 商品下架或无法购买时淘汰</label><label><input type="checkbox" checked={ruleConfig.rejectMissingCriticalData} onChange={(event) => setRuleConfig({...ruleConfig,rejectMissingCriticalData:event.target.checked})} /> 关键规则数据缺失时淘汰</label><label>48H揽收率最低值（%）<input type="number" min="0" max="100" value={ruleConfig.pickup48Min} onChange={(event) => setRuleConfig({...ruleConfig,pickup48Min:Number(event.target.value)})} /></label><label>商品评价数量最低值（条）<input type="number" min="0" value={ruleConfig.reviewCountMin} onChange={(event) => setRuleConfig({...ruleConfig,reviewCountMin:Number(event.target.value)})} /></label><label>商品收藏数量最低值<input type="number" min="0" value={ruleConfig.productFavoriteMin} onChange={(event) => setRuleConfig({...ruleConfig,productFavoriteMin:Number(event.target.value)})} /></label><label>商品/代发品质最低值（%）<input type="number" min="0" max="100" value={ruleConfig.qualityMin} onChange={(event) => setRuleConfig({...ruleConfig,qualityMin:Number(event.target.value)})} /></label><label>好评率最低值（%）<input type="number" min="0" max="100" value={ruleConfig.positiveReviewMin} onChange={(event) => setRuleConfig({...ruleConfig,positiveReviewMin:Number(event.target.value)})} /></label></div><div className="action-buttons" style={{marginTop:16}}><button className="btn" type="button" disabled={savingRules} onClick={() => void saveRuleConfig()}>{savingRules ? "保存中…" : "保存规则"}</button><button className="secondary-btn" type="button" onClick={() => setRuleConfig({ requireOnePiece:true, require1688Selection:false, requireReturnShipping:false, requireNoReasonReturn:false, rejectNoSellableSku:true, requireSingleOrder:true, rejectInvalidProduct:true, rejectMissingCriticalData:false, pickup48Min:70, qualityMin:70, reviewCountMin:0, productFavoriteMin:0, positiveReviewMin:0 })}>恢复默认值</button></div></section>}
+      {batchApprovalMessage && <div className="status-box success">{batchApprovalMessage}</div>}
+      {rejectionRate >= 60 && <div className="rule-strictness-warning"><div><b>当前规则可能过严</b><span>{rejectionRate}% 的货源未通过规则。可编辑规则后重置并重新运行，或直接点击顶部“重置规则”恢复全量候选。</span></div><div className="warning-actions"><button type="button" onClick={() => void openRuleEditor()}>检查规则</button></div></div>}
+      {showRuleEditor && <section className="v2-card" style={{marginBottom:16}}><div className="proposal-head"><div><h3>规则淘汰设置</h3><p>不考虑价格、运费、包邮、优惠券或折扣。保存后点击“规则初筛”生效。</p></div><button type="button" className="drawer-close" onClick={() => setShowRuleEditor(false)}>×</button></div><div className="form-grid"><label><input type="checkbox" checked={ruleConfig.requireOnePiece} onChange={(event) => setRuleConfig({...ruleConfig,requireOnePiece:event.target.checked})} /> 要求支持一件代发</label><label><input type="checkbox" checked={ruleConfig.require1688Selection} onChange={(event) => setRuleConfig({...ruleConfig,require1688Selection:event.target.checked})} /> 要求为1688严选商品</label><label><input type="checkbox" checked={ruleConfig.requireReturnShipping} onChange={(event) => setRuleConfig({...ruleConfig,requireReturnShipping:event.target.checked})} /> 要求支持退货包运费</label><label><input type="checkbox" checked={ruleConfig.requireNoReasonReturn} onChange={(event) => setRuleConfig({...ruleConfig,requireNoReasonReturn:event.target.checked})} /> 要求支持7天无理由退货</label><label><input type="checkbox" checked={ruleConfig.rejectNoSellableSku} onChange={(event) => setRuleConfig({...ruleConfig,rejectNoSellableSku:event.target.checked})} /> 已知SKU全部无货时淘汰</label><label><input type="checkbox" checked={ruleConfig.requireSingleOrder} onChange={(event) => setRuleConfig({...ruleConfig,requireSingleOrder:event.target.checked})} /> 要求可以单件下单</label><label><input type="checkbox" checked={ruleConfig.rejectInvalidProduct} onChange={(event) => setRuleConfig({...ruleConfig,rejectInvalidProduct:event.target.checked})} /> 商品下架或无法购买时淘汰</label><label><input type="checkbox" checked={ruleConfig.rejectMissingCriticalData} onChange={(event) => setRuleConfig({...ruleConfig,rejectMissingCriticalData:event.target.checked})} /> 关键规则数据缺失时淘汰</label><label>48H揽收率最低值（%）<input type="number" min="0" max="100" value={ruleConfig.pickup48Min} onChange={(event) => setRuleConfig({...ruleConfig,pickup48Min:Number(event.target.value)})} /></label><label>商品评价数量最低值（条）<input type="number" min="0" value={ruleConfig.reviewCountMin} onChange={(event) => setRuleConfig({...ruleConfig,reviewCountMin:Number(event.target.value)})} /></label><label>商品收藏数量最低值<input type="number" min="0" value={ruleConfig.productFavoriteMin} onChange={(event) => setRuleConfig({...ruleConfig,productFavoriteMin:Number(event.target.value)})} /></label><label>商品/代发品质最低值（%）<input type="number" min="0" max="100" value={ruleConfig.qualityMin} onChange={(event) => setRuleConfig({...ruleConfig,qualityMin:Number(event.target.value)})} /></label><label>好评率最低值（%）<input type="number" min="0" max="100" value={ruleConfig.positiveReviewMin} onChange={(event) => setRuleConfig({...ruleConfig,positiveReviewMin:Number(event.target.value)})} /></label></div><div className="action-buttons" style={{marginTop:16}}><button className="btn" type="button" disabled={savingRules} onClick={() => void saveRuleConfig()}>{savingRules ? "保存中…" : "保存规则"}</button><button className="secondary-btn" type="button" onClick={() => setRuleConfig({ ...DEFAULT_OFFER_RULE_CONFIG })}>恢复默认值</button></div></section>}
       <div className={`sourcing-offer-layout${selected ? " has-detail" : ""}`}>
       <div className="table-wrap"><table className="v2-table offer-admission-table decision-table">
-        <colgroup>{[22,13,13,16,10,12,9,5].map((width,index) => <col key={index} style={{width:`${width}%`}} />)}</colgroup>
+        <colgroup>{[25,15,18,13,13,10,6].map((width,index) => <col key={index} style={{width:`${width}%`}} />)}</colgroup>
         <thead>
           <tr>
             <th>商品</th>
             <th>供应商</th>
-            <th>分类</th>
-            <th>AI商品名称</th>
+            <th>标准商品名</th>
             <th>商品分类</th>
             <th>AI结论</th>
             <th>人工决策</th>
@@ -1407,15 +1519,16 @@ function OfferTable({ offers, runId, onRefresh, onRetryOffer, rechecking }: { of
         <tbody>
           {rows.map((o) => {
             const facts = offerFactsOf(o),
+              restoredForAi = rulesAppliedToAi && ruleDecisionOf(o) === "REJECTED" && ruleEligibleForAi(o),
+              skippedByRule = rulesAppliedToAi && !ruleEligibleForAi(o),
               hasSelectionTitle = booleanFact(facts, "hasSelectionTitle"),
               selectionTitle = stringFact(facts, "selectionTitle"),
               productRecognition = productRecognitionOf(o),
+              aiSelection = offerAiSelection(o),
               recognitionGroups = Array.isArray(rawRecord(o.raw_data.productRecognition).productGroups) ? (rawRecord(o.raw_data.productRecognition).productGroups as unknown[]).map(rawRecord) : [],
               primaryGroup = recognitionGroups[0],
-              standardName = primaryGroup ? String(primaryGroup.standardName ?? productRecognition?.productName ?? "") : productRecognition?.productName ?? "",
-              sellingTitle = primaryGroup ? String(primaryGroup.sellingTitle ?? productRecognition?.sellingTitle ?? "") : productRecognition?.sellingTitle ?? "",
+              standardName = aiSelection?.standardProductName ?? aiSelection?.internalCategoryName ?? (primaryGroup ? String(primaryGroup.standardName ?? productRecognition?.productName ?? "") : productRecognition?.productName ?? ""),
               detailIncomplete = detailParseFailed(o);
-            const aiSelection = offerAiSelection(o);
             return (
               <tr key={o.id} className={selected?.id === o.id ? "active" : ""}>
                 <td>
@@ -1428,17 +1541,16 @@ function OfferTable({ offers, runId, onRefresh, onRetryOffer, rechecking }: { of
                   {o.supplier_name && <b>{cleanSupplier(o.supplier_name)}</b>}
                   {(o.shop_age != null || o.repurchase_rate != null) && <small>{o.shop_age != null ? `经营 ${o.shop_age} 年` : "年限待确认"}{o.repurchase_rate != null ? ` · 回头率 ${percent(o.repurchase_rate)}` : ""}</small>}
                 </td>
-                <td>{stringFact(facts, "productCategory") ?? "待采集"}</td>
                 <td>
-                  {ruleDecisionOf(o) === "REJECTED" ? <><span className="v2-pill">已跳过</span><small>恢复候选后可运行AI</small></> : standardName || sellingTitle ? <div className="ai-name-cell">{standardName && <><span>标准商品名</span><b>{standardName}</b></>}{sellingTitle && <><span>售卖标题</span><small>{sellingTitle}</small></>}</div> : <span className="v2-pill reading">待AI命名</span>}
+                  {skippedByRule ? <><span className="v2-pill">已跳过</span><small>恢复候选后可运行AI</small></> : standardName ? <div className="ai-name-cell"><span>标准商品名</span><b>{standardName}</b></div> : <><span className="v2-pill reading">待AI识别</span>{restoredForAi && <small>人工恢复候选</small>}</>}
                 </td>
-                <td>{ruleDecisionOf(o) === "REJECTED" ? <span className="v2-pill">已跳过</span> : productRecognition || primaryGroup ? <div className="category-cell"><small>{String(primaryGroup?.categoryParent ?? productRecognition?.categoryParent ?? "一级分类待确认")}</small><b>{String(primaryGroup?.categoryChild ?? productRecognition?.categoryChild ?? "二级分类待确认")}</b></div> : <span className="v2-pill reading">待AI分类</span>}</td>
+                <td>{skippedByRule ? <span className="v2-pill">已跳过</span> : aiSelection?.categoryChild || productRecognition || primaryGroup ? <div className="category-cell"><small>{String(aiSelection?.categoryParent ?? primaryGroup?.categoryParent ?? productRecognition?.categoryParent ?? "一级分类待确认")}</small><b>{String(aiSelection?.categoryChild ?? primaryGroup?.categoryChild ?? productRecognition?.categoryChild ?? "二级分类待确认")}</b></div> : <span className="v2-pill reading">待AI分类</span>}</td>
                 <td>
-                  {ruleDecisionOf(o) === "REJECTED" ? <><span className="v2-pill">已跳过</span><small>规则淘汰，不消耗 AI 分析</small></> : aiSelection ? <><span className={`v2-pill ${aiSelection.recommendation === "RECOMMENDED" ? "success" : aiSelection.recommendation === "NOT_RECOMMENDED" ? "danger" : ""}`}>{aiRecommendationLabel(aiSelection.recommendation)}</span><small className="ai-reason-line">{aiSelection.recommendationReason}</small></> : <span className="v2-pill reading">待AI分析</span>}
+                  {skippedByRule ? <><span className="v2-pill">已跳过</span><small>规则淘汰，不消耗 AI 分析</small></> : aiSelection ? <><span className={`v2-pill ${aiSelection.recommendation === "RECOMMENDED" ? "success" : aiSelection.recommendation === "NOT_RECOMMENDED" ? "danger" : ""}`}>{aiRecommendationLabel(aiSelection.recommendation)}</span><small className="ai-reason-line">{aiSelection.recommendationReason}</small></> : <><span className="v2-pill reading">待AI分析</span>{restoredForAi && <small>人工恢复，允许分析</small>}</>}
                 </td>
                 <td>
                   {stateOf(o) === "REJECTED" ? <span className="v2-pill danger">人工淘汰</span> : <span className={`v2-pill ${["PRIMARY", "BACKUP"].includes(stateOf(o)) ? "success" : ""}`}>{selectionLabel[stateOf(o)]}</span>}
-                  {ruleDecisionOf(o) === "REJECTED" && <details className="rejection-reasons"><summary>规则淘汰 · 查看原因</summary><ul>{stringArray(ruleSelectionOf(o).hardFailures).map((reason) => <li key={reason}>{reason}</li>)}</ul></details>}
+                  {ruleDecisionOf(o) === "REJECTED" && <details className="rejection-reasons"><summary>{!rulesAppliedToAi ? "历史规则未通过 · 查看原因" : restoredForAi ? "人工恢复 · 查看原规则原因" : "规则淘汰 · 查看原因"}</summary><ul>{stringArray(ruleSelectionOf(o).hardFailures).map((reason) => <li key={reason}>{reason}</li>)}</ul></details>}
                 </td>
                 <td>
                   <button type="button" onClick={(event) => { event.stopPropagation(); setSelectedId(o.id); }}>详情</button>
@@ -1454,10 +1566,10 @@ function OfferTable({ offers, runId, onRefresh, onRetryOffer, rechecking }: { of
           <div className="v2-filter-group offer-status-tabs">
             {(["SKU","PRODUCT","SUPPLIER","DROPSHIP","FULFILLMENT","AI"] as const).map((value) => <button key={value} className={detailTab === value ? "v2-primary" : "v2-secondary"} onClick={() => setDetailTab(value)}>{value === "SKU" ? "SourceSKU库存" : value === "PRODUCT" ? "商品信息" : value === "SUPPLIER" ? "供应商信息" : value === "DROPSHIP" ? "分销代发" : value === "FULFILLMENT" ? "履约能力" : "AI判断"}</button>)}
           </div>
-          <section className="drawer-verdict-summary">
-            <div><span>AI结论</span><b>{selected && ruleDecisionOf(selected) === "REJECTED" ? "已跳过" : selectedAi ? aiRecommendationLabel(selectedAi.recommendation) : "待AI分析"}</b><small>{selectedAi ? `置信度：${selectedAi.confidence === "HIGH" ? "高" : selectedAi.confidence === "MEDIUM" ? "中" : "低"}` : selected && ruleDecisionOf(selected) === "REJECTED" ? "该货源已被规则淘汰" : "等待本轮分析"}</small></div>
-            <p>{selectedAi?.recommendationReason ?? (selected && ruleDecisionOf(selected) === "REJECTED" ? stringArray(ruleSelectionOf(selected).hardFailures).join("；") : "完成 AI 分析后，这里会显示核心理由。")}</p>
-          </section>
+          {detailTab !== "AI" && <section className="drawer-verdict-summary">
+            <div><span>AI结论</span><b>{selected && rulesAppliedToAi && !ruleEligibleForAi(selected) ? "已跳过" : selectedAi ? aiRecommendationLabel(selectedAi.recommendation) : "待AI分析"}</b><small>{selectedAi ? `置信度：${selectedAi.confidence === "HIGH" ? "高" : selectedAi.confidence === "MEDIUM" ? "中" : "低"}` : selected && rulesAppliedToAi && !ruleEligibleForAi(selected) ? "该货源已被规则淘汰" : selected && rulesAppliedToAi && ruleDecisionOf(selected) === "REJECTED" ? "已人工恢复，等待本轮分析" : "等待本轮分析"}</small></div>
+            <p>{selectedAi?.recommendationReason ?? (selected && rulesAppliedToAi && !ruleEligibleForAi(selected) ? stringArray(ruleSelectionOf(selected).hardFailures).join("；") : "完成 AI 分析后，这里会显示核心理由。")}</p>
+          </section>}
           {detailTab === "SKU" && <div className="table-wrap sourcing-sku-table"><table className="v2-table compact source-sku-only-table"><thead><tr><th>图片</th><th>SourceSKU</th><th>采购价</th><th>库存</th></tr></thead><tbody>{sourceSkus.length ? sourceSkus.map((sku,index) => { const price = sku.dropshipPrice ?? sku.wholesalePrice, image = sku.image ?? sku.imageUrl, rawName = String(sku.rawSpecText ?? sku.specName ?? `SourceSKU ${index+1}`), normalizedName = String(sku.specName ?? ""), values = Array.isArray(sku.specValues) ? sku.specValues.map(String).filter(Boolean).join(" / ") : "", skuId = sku.skuId ?? sku.sourceVariantId ?? sku.id; return <tr key={String(sku.id ?? index)}><td>{image ? <img className="v2-mini-img" src={String(image)} alt="" /> : "—"}</td><td><b>{rawName}</b>{normalizedName && normalizedName !== rawName && <small>{normalizedName}</small>}{values && values !== rawName && values !== normalizedName && <small>{values}</small>}<small>{String(skuId)}</small></td><td>{price == null ? "待确认" : money(Number(price))}</td><td>{sku.inventory == null ? "待确认" : String(sku.inventory)}</td></tr>}) : <tr><td colSpan={4}>本次货源详情解析未返回 SourceSKU</td></tr>}</tbody></table></div>}
           {detailTab === "PRODUCT" && <div className="decision-sections"><section><h3>采购与市场表现</h3><dl className="candidate-facts"><div><span>采购价</span><b>{stringFact(selectedFacts,"offerPriceDisplay") ?? money(selected.price_min)}</b></div>{stringFact(selectedFacts,"newcomerPriceDisplay") && <div><span>新人价</span><b>{stringFact(selectedFacts,"newcomerPriceDisplay")}</b></div>}<div><span>MOQ</span><b>{selected.minimum_order_quantity ?? "待确认"}</b></div><div><span>库存</span><b>{selected.stock ?? "待确认"}</b></div><div><span>销量</span><b>{stringFact(selectedFacts,"salesDisplay") ?? selected.sales_count ?? "待确认"}</b></div></dl></section><section><h3>商品评价</h3><dl className="attribute-list">{numberFact(selectedFacts,"productRating") != null && <div><dt>商品评分</dt><dd>{numberFact(selectedFacts,"productRating")?.toFixed(1)}</dd></div>}{(stringFact(selectedFacts,"totalReviewCountDisplay") || numberFact(selectedFacts,"totalReviewCount") != null) && <div><dt>总评价数</dt><dd>{stringFact(selectedFacts,"totalReviewCountDisplay") ?? numberFact(selectedFacts,"totalReviewCount")}条评价</dd></div>}{(stringFact(selectedFacts,"positiveReviewCountDisplay") || stringFact(selectedFacts,"productReviewCountDisplay") || numberFact(selectedFacts,"positiveReviewCount") != null || numberFact(selectedFacts,"productReviewCount") != null) && <div><dt>好评人数</dt><dd>{stringFact(selectedFacts,"positiveReviewCountDisplay") ?? stringFact(selectedFacts,"productReviewCountDisplay") ?? numberFact(selectedFacts,"positiveReviewCount") ?? numberFact(selectedFacts,"productReviewCount")}</dd></div>}{numberFact(selectedFacts,"positiveReviewRate") != null && <div><dt>好评率</dt><dd>{percent(numberFact(selectedFacts,"positiveReviewRate"))}</dd></div>}{numberFact(selectedFacts,"productRepurchaseRate") != null && <div><dt>商品复购率</dt><dd>{percent(numberFact(selectedFacts,"productRepurchaseRate"))}</dd></div>}</dl></section><section><h3>铺货素材</h3><dl className="attribute-list"><div><dt>商品标题</dt><dd>{selected.title}</dd></div>{mainImageCount != null && <div><dt>主图</dt><dd>{mainImageCount} 张</dd></div>}{skuImageCount != null && <div><dt>SKU图</dt><dd>{skuImageCount} 张</dd></div>}{detailImageCount != null && <div><dt>详情图</dt><dd>{detailImageCount} 张</dd></div>}<div><dt>商品属性</dt><dd>{productAttributes.length ? "有" : "无"}</dd></div></dl>{productAttributes.length > 0 && <dl className="attribute-list">{productAttributes.map(([name,value]) => <div key={name}><dt>{name}</dt><dd>{value}</dd></div>)}</dl>}</section></div>}
           {detailTab === "SUPPLIER" && <div className="decision-sections"><section><h3>供应商画像</h3><dl className="attribute-list"><div><dt>公司名称</dt><dd>{selected.supplier_name ? cleanSupplier(selected.supplier_name) : "待确认"}</dd></div>{stringFact(selectedFacts,"merchantType") && <div><dt>商家类型</dt><dd>{stringFact(selectedFacts,"merchantType")}</dd></div>}{stringFact(selectedFacts,"merchantLevel") && <div><dt>供应链等级</dt><dd>{stringFact(selectedFacts,"merchantLevel")}</dd></div>}{stringFact(selectedFacts,"mainCategory") && <div><dt>主营类目</dt><dd>{stringFact(selectedFacts,"mainCategory")}</dd></div>}<div><dt>经营年限</dt><dd>{selected.shop_age == null ? "待确认" : `${selected.shop_age} 年`}</dd></div><div><dt>店铺回头率</dt><dd>{percent(selected.repurchase_rate)}</dd></div><div><dt>品质达标率</dt><dd>{selected.quality_rate == null ? "待评估" : percent(selected.quality_rate)}</dd></div><div><dt>店铺48小时支揽率</dt><dd>{percent(numberFact(selectedFacts,"shopPickup48Rate"))}</dd></div>{selected.inspection === true && <div><dt>深度验厂</dt><dd>已验厂</dd></div>}</dl></section><section><h3>质量依据</h3><ul className="decision-checks"><li>经营年限：{selected.shop_age == null ? "待获取" : `${selected.shop_age} 年`}</li><li>回头率：{percent(selected.repurchase_rate)}</li><li>退货保障：{fact(selected.return_shipping === true || selected.no_reason_return === true,"支持")}</li></ul></section></div>}
@@ -1499,7 +1611,7 @@ function OfferTable({ offers, runId, onRefresh, onRetryOffer, rechecking }: { of
               </section>
             </div>
           )}
-          {detailTab === "AI" && (() => { const groups = Array.isArray(rawRecord(selected.raw_data.productRecognition).productGroups) ? (rawRecord(selected.raw_data.productRecognition).productGroups as unknown[]).map(rawRecord) : []; return groups.some((group) => group.sellingTitle) ? <div className="decision-sections ai-decision"><section><h3>商品名称</h3>{groups.map((group, index) => <dl className="attribute-list" key={`${String(group.standardName)}-${index}`}><div><dt>标准商品名</dt><dd>{String(group.standardName ?? "未返回")}</dd></div><div><dt>售卖标题</dt><dd>{String(group.sellingTitle ?? "未返回")}</dd></div></dl>)}</section></div> : null; })()}
+          {detailTab === "AI" && (() => { const groups = Array.isArray(rawRecord(selected.raw_data.productRecognition).productGroups) ? (rawRecord(selected.raw_data.productRecognition).productGroups as unknown[]).map(rawRecord) : []; return groups.some((group) => group.standardName) ? <div className="decision-sections ai-decision"><section><h3>内部分类</h3>{groups.map((group, index) => <dl className="attribute-list" key={`${String(group.standardName)}-${index}`}><div><dt>内部分类名称</dt><dd>{String(group.standardName ?? "未返回")}</dd></div></dl>)}</section></div> : null; })()}
           {detailTab === "AI" && (() => {
             const recognition = rawRecord(selected.raw_data.productRecognition), groups = Array.isArray(recognition.productGroups) ? recognition.productGroups.map(rawRecord) : [],
               evidence = stringArray(recognition.evidence), recognitionRisks = stringArray(recognition.risks), unresolvedSkus = stringArray(recognition.unresolvedSkus);
@@ -1509,7 +1621,7 @@ function OfferTable({ offers, runId, onRefresh, onRetryOffer, rechecking }: { of
           {detailTab === "AI" && (() => { const ai = offerAiSelection(selected); return ai ? <div className="decision-sections ai-decision"><section><h3>AI结论：{aiRecommendationLabel(ai.recommendation)}</h3><p>结论置信度：{ai.confidence === "HIGH" ? "高" : ai.confidence === "MEDIUM" ? "中" : "低"}</p><span className={`v2-pill ${ai.recommendation === "RECOMMENDED" ? "success" : ai.recommendation === "NOT_RECOMMENDED" ? "danger" : ""}`}>{aiRecommendationLabel(ai.recommendation)}</span></section><section><h3>五维评估</h3><dl className="attribute-list"><div><dt>代发适配</dt><dd>{ai.dimensions.dropshipFit}</dd></div><div><dt>供货稳定</dt><dd>{ai.dimensions.supplyStability}</dd></div><div><dt>履约稳定</dt><dd>{ai.dimensions.fulfillmentStability}</dd></div><div><dt>质量可信度</dt><dd>{ai.dimensions.qualityConfidence}</dd></div><div><dt>商家稳定性</dt><dd>{ai.dimensions.supplierStability}</dd></div></dl></section><section><h3>推荐理由</h3><p>{ai.recommendationReason}</p></section><section><h3>优势</h3>{ai.advantages.length ? <ul className="decision-checks">{ai.advantages.map((item) => <li key={item}>{item}</li>)}</ul> : <p className="decision-empty">暂无明确优势</p>}</section><section><h3>风险</h3>{ai.risks.length ? <ul className="decision-risks">{ai.risks.map((item) => <li key={item}>{item}</li>)}</ul> : <p className="decision-empty">暂无明确风险</p>}</section>{ai.conflicts.length > 0 && <section><h3>证据冲突</h3><ul className="decision-risks">{ai.conflicts.map((item) => <li key={item}>{item}</li>)}</ul></section>}{ai.missingEvidence.length > 0 && <section><h3>缺失证据</h3><ul className="decision-risks">{ai.missingEvidence.map((item) => <li key={item}>{item}</li>)}</ul></section>}<section><h3>最终建议</h3><p>{ai.finalAdvice}</p></section></div> : <div className="decision-sections ai-decision"><section><h3>AI评估货源</h3><p className="decision-empty">尚未运行本轮「AI评估货源」。</p></section></div>; })()}
           {actionError && <div className="status-box error">{actionError}</div>}
           {productLinks[selected.id] && <div className="status-box success">货源已选择，商品已进入「待制作」。<Link className="text-link" href={productLinks[selected.id]}>前往商品中心制作 →</Link></div>}
-          <div className="action-buttons" style={{marginTop:16}}>{selected && ruleDecisionOf(selected) === "REJECTED" ? <button className="btn" disabled={saving} onClick={() => void choose("CANDIDATE")}>恢复候选并允许AI分析</button> : <><button className="btn" disabled={saving || ["PRIMARY", "BACKUP"].includes(stateOf(selected))} onClick={() => void choose("PRIMARY")}>{["PRIMARY", "BACKUP"].includes(stateOf(selected)) ? "已选择" : "选择货源"}</button><button className="secondary-btn" disabled={saving} onClick={() => void choose("REJECTED")}>人工淘汰</button></>}</div>
+          <div className="action-buttons" style={{marginTop:16}}>{selected && rulesAppliedToAi && !ruleEligibleForAi(selected) ? <button className="btn" disabled={saving} onClick={() => void choose("CANDIDATE")}>恢复候选并允许AI分析</button> : selected && isDataPending(selected) ? <><button className="btn" disabled={rechecking} onClick={() => void onRetryOffer(selected)}>{rechecking ? "解析中…" : "重新解析缺失项"}</button><button className="secondary-btn" disabled={saving} onClick={() => void choose("REJECTED")}>人工淘汰</button></> : selected && !offerAiSelection(selected) ? <><button className="btn" disabled>等待AI分析后再选择</button><button className="secondary-btn" disabled={saving} onClick={() => void choose("REJECTED")}>人工淘汰</button></> : <><button className="btn" disabled={saving || ["PRIMARY", "BACKUP"].includes(stateOf(selected))} onClick={() => void choose("PRIMARY")}>{["PRIMARY", "BACKUP"].includes(stateOf(selected)) ? "已选择" : "选择货源"}</button><button className="secondary-btn" disabled={saving} onClick={() => void choose("REJECTED")}>人工淘汰</button></>}</div>
       </aside>}
       </div>
     </>

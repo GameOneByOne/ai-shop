@@ -19,6 +19,7 @@ const schema = z.object({
   query: z.string().min(2),
   keywords: z.array(z.string().min(1)).min(1),
   targetOfferCount: z.number().int().min(1).max(500),
+  extensionVersion: z.string().trim().min(1).max(30).optional(),
   collection: z.object({
     pagesFetched: z.number().int().min(1).max(1500),
     uniqueCount: z.number().int().min(0),
@@ -62,6 +63,7 @@ export async function POST(request: Request) {
     afterSalesReserve: 0.5,
     platformAndPromotionRate: 0.16,
     targetOfferCount: parsed.data.targetOfferCount,
+    extensionVersion: parsed.data.extensionVersion ?? null,
     searchFilters: parsed.data.collection.appliedFilters ?? {},
     pipeline: {
       stage1Status: "COMPLETED",

@@ -16,7 +16,16 @@ export async function POST(request: Request) {
   const trace = traceOf(product.data.notes), listing = record(trace.listing);
   if (String(listing.taobaoItemId || "") !== parsed.data.snapshot.itemId) return Response.json({ error: "淘宝草稿与当前商品ID不匹配" }, { status: 409 });
   try {
-    const result = await enhanceTaobaoDraft(parsed.data.snapshot, { name: product.data.name, category: product.data.category, estimatedCost: product.data.estimated_cost, sourceTitle: trace.title, sourceOfferId: trace.externalOfferId, sourceFacts: trace.sourceFacts, sourceSkus: trace.sourceSkus });
+    const sourceProducts = Array.isArray(trace.sourceProducts) ? trace.sourceProducts.map(record) : [];
+    const sourceSkus = sourceProducts.flatMap((product) => Array.isArray(product.skus) ? product.skus.map(record) : []).map((sku, index) => ({
+      sourceSkuId: String(sku.skuId ?? sku.sourceVariantId ?? sku.id ?? `source-sku-${index + 1}`),
+      name: String(sku.rawSpecText ?? sku.specName ?? sku.name ?? `SourceSKU ${index + 1}`),
+      attributes: sku.specValues ?? sku.attributes ?? {},
+      imageUrl: sku.image ?? sku.imageUrl ?? null,
+      price: sku.dropshipPrice ?? sku.wholesalePrice ?? sku.price ?? null,
+      stock: sku.inventory ?? sku.stock ?? null,
+    }));
+    const result = await enhanceTaobaoDraft(parsed.data.snapshot, { name: product.data.name, category: product.data.category, estimatedCost: product.data.estimated_cost, sourceTitle: trace.title, sourceOfferId: trace.externalOfferId, sourceFacts: trace.sourceFacts, sourceSkus });
     const generatedAt = new Date().toISOString();
     const update = await db.from("candidate_products").update({ notes: JSON.stringify({ ...trace, listing: { ...listing, draftSnapshot: result.snapshot, draftCapturedAt: generatedAt, enhancement: { ...result.data, model: result.model, generatedAt, version: 1 } } }) }).eq("id", product.data.id).eq("user_id", auth.user.id);
     if (update.error) return Response.json({ error: update.error.message }, { status: 500 });

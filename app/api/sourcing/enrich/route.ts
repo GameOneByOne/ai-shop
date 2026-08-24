@@ -143,8 +143,14 @@ const detail = z.object({
 });
 const schema = z.object({
   runId: z.string().uuid(),
-  details: z.array(detail).min(1).max(50),
+  details: z.array(detail).max(500),
   factsOnly: z.boolean().optional().default(false),
+  checkpoint: z.boolean().optional().default(false),
+  finalize: z.boolean().optional().default(false),
+  totalDetails: z.number().int().min(0).max(500).optional(),
+}).refine((value) => value.details.length > 0 || value.finalize, {
+  message: "批次不能为空",
+  path: ["details"],
 });
 
 function economics(
@@ -199,6 +205,8 @@ export async function POST(request: Request) {
       })),
     }, { status: 400 });
   }
+  if (parsed.data.finalize && (parsed.data.totalDetails ?? 0) <= 0)
+    return Response.json({ error: "没有成功保存任何货源详情，解析阶段不能标记为完成" }, { status: 422 });
   const db = await createClient(),
     { data: auth } = await db.auth.getUser();
   if (!auth.user) return Response.json({ error: "请先登录" }, { status: 401 });
@@ -439,11 +447,18 @@ export async function POST(request: Request) {
     if (updateError)
       return Response.json({ error: updateError.message }, { status: 500 });
   }
+  if (parsed.data.checkpoint) {
+    return Response.json({
+      ok: true,
+      runId: run.id,
+      checkpointedOffers: parsed.data.details.length,
+    });
+  }
   if (parsed.data.factsOnly) {
     return Response.json({
       ok: true,
       runId: run.id,
-      qualifiedOffers: parsed.data.details.length,
+      qualifiedOffers: parsed.data.totalDetails ?? parsed.data.details.length,
     });
   }
   const oldReview = oldCriteria.directionReview as
@@ -464,7 +479,7 @@ export async function POST(request: Request) {
     ...oldCriteria,
     detailEnrichment: {
       completedAt: new Date().toISOString(),
-      offerCount: parsed.data.details.length,
+      offerCount: parsed.data.totalDetails ?? parsed.data.details.length,
     },
     pipeline: {
       ...oldPipeline,
@@ -484,7 +499,7 @@ export async function POST(request: Request) {
     .from("sourcing_runs")
     .update({
       criteria,
-      eligible_count: parsed.data.details.length,
+      eligible_count: parsed.data.totalDetails ?? parsed.data.details.length,
       status: "completed",
       completed_at: new Date().toISOString(),
     })
@@ -494,6 +509,6 @@ export async function POST(request: Request) {
   return Response.json({
     ok: true,
     runId: run.id,
-    enrichedOffers: parsed.data.details.length,
+    enrichedOffers: parsed.data.totalDetails ?? parsed.data.details.length,
   });
 }

@@ -1066,7 +1066,7 @@ async function enrichOffers(offers, onProgress = () => {}, onCheckpoint = () => 
 }
 
 chrome.runtime.onConnect.addListener((port) => {
-  if (!["DETAIL_ENRICHMENT", "OFFER_CAPTURE"].includes(port.name)) return;
+  if (!["TAOBAO_AUTOFILL", "TAOBAO_DRAFT_CAPTURE"].includes(port.name)) return;
   port.onMessage.addListener((message) => {
     if (port.name === "TAOBAO_DRAFT_CAPTURE") {
       if (message?.type !== "CAPTURE_TAOBAO_DRAFT") return;

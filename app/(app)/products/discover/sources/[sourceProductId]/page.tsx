@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useParams, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { isTrustedPrice, type SourceSkuRecord } from "@/lib/sourcing/source-products";
+import { calculateSkuListingPrice, isTrustedPrice, type SourceSkuRecord } from "@/lib/sourcing/source-products";
 
 type SourceProduct = {
   id: string;
@@ -301,9 +301,11 @@ export default function SourceDetailPage() {
             <thead>
               <tr>
                 <th>选择</th>
+                <th>SKU图</th>
                 <th>规格</th>
                 <th>代发价</th>
                 <th>普通批发价</th>
+                <th>定价</th>
                 <th>代发MOQ</th>
                 <th>库存</th>
                 <th>代发是否密文</th>
@@ -318,6 +320,7 @@ export default function SourceDetailPage() {
                 const confidence = isTrusted ? "高可信" : "待核实";
                 const status = sku.priceStatus === "NEEDS_REVIEW" ? "待核实" : sku.priceStatus;
                 const isSelected = selectedSkus.includes(sku.id);
+                const listingPrice = calculateSkuListingPrice(sku.targetSalePriceMin, sku.shippingFee);
                 const form = forms[sku.id] ?? {
                   dropshipPrice: "",
                   dropshipMoq: "",
@@ -341,9 +344,11 @@ export default function SourceDetailPage() {
                         }}
                       />
                     </td>
+                    <td>{sku.image ? <img className="v2-mini-img" src={sku.image} alt={sku.specName || "SourceSKU"} /> : "—"}</td>
                     <td>{sku.specName || "待核实规格"}</td>
                     <td>{moneyText(sku.dropshipPrice)}</td>
                     <td>{moneyText(sku.wholesalePrice)}</td>
+                    <td>{listingPrice == null ? "待核实" : <><b>{moneyText(listingPrice)}</b><small style={{display:"block"}}>规则 {moneyText(sku.targetSalePriceMin)} + 运费 {moneyText(sku.shippingFee)}</small></>}</td>
                     <td>{sku.dropshipMoq == null ? "待核实" : sku.dropshipMoq}</td>
                     <td>{sku.inventory == null ? "待核实" : sku.inventory}</td>
                     <td>{sourceProduct.supports_privacy_dropshipping ? "是" : "否"}</td>
