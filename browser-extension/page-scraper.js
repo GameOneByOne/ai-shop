@@ -312,6 +312,8 @@ function visiblePublishControl(pattern, root = document) {
   });
 }
 
+const immediatePublishPattern = /^立即铺货(?:（(?:单店|多店)）|\((?:单店|多店)\))?$/;
+
 async function startDefaultPublish() {
   const stages = [];
   const publishEntries = [...document.querySelectorAll("button,a,[role=button]")].filter((node) => {
@@ -348,7 +350,7 @@ async function startDefaultPublish() {
       return rect.width > 0 && rect.height > 0 && /确认店铺/.test(text);
     }) || null;
     if (!panel) {
-      const confirmAnchor = visiblePublishControl(/^立即铺货$/);
+      const confirmAnchor = visiblePublishControl(immediatePublishPattern);
       panel = confirmAnchor ? containingPanel(confirmAnchor) : null;
     }
     if (!panel) {
@@ -389,7 +391,7 @@ async function startDefaultPublish() {
   if (!storeSelected()) throw new Error("已找到淘宝店铺，但自动勾选未生效");
   stages.push("checked_default_store");
 
-  const confirm = visiblePublishControl(/^立即铺货$/, panel);
+  const confirm = visiblePublishControl(immediatePublishPattern, panel);
   if (!confirm) throw new Error("“确认店铺”抽屉中找不到底部“立即铺货”按钮");
   for (let attempt = 0; attempt < 20 && (confirm.disabled || confirm.getAttribute("aria-disabled") === "true"); attempt += 1) await wait(250);
   if (confirm.disabled || confirm.getAttribute("aria-disabled") === "true") throw new Error("店铺已勾选，但底部“立即铺货”按钮仍未启用");

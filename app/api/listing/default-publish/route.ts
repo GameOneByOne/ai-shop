@@ -25,11 +25,17 @@ export async function POST(request: Request) {
   if (parsed.data.action === "START") {
     const sourceUrl = typeof trace.sourceUrl === "string" ? trace.sourceUrl : "";
     if (!/^https:\/\/(?:[^/]+\.)?1688\.com\//i.test(sourceUrl)) return Response.json({ error: "未找到有效的 1688 货源地址" }, { status: 400 });
+    if (listing.officialStatus === "SUCCESS") {
+      return Response.json({ error: "该 Offer 已在 1688 官方日志中铺货成功，已阻止重复铺货" }, { status: 409 });
+    }
+    if (/重复铺货|货源重复|重复货源/.test(String(listing.error || ""))) {
+      return Response.json({ error: "1688 官方日志已判定该 Offer 重复铺货，已阻止再次提交" }, { status: 409 });
+    }
     const update = await db.from("candidate_products").update({ notes: JSON.stringify({ ...trace, listing: { ...listing, status: "PUBLISHING", mode: "DEFAULT_TEMPLATE_UNCHANGED", startedAt: new Date().toISOString() } }) }).eq("id", parsed.data.productId).eq("user_id", auth.user.id);
     if (update.error) return Response.json({ error: update.error.message }, { status: 500 });
     return Response.json({ sourceUrl });
   }
-  const update = await db.from("candidate_products").update({ notes: JSON.stringify({ ...trace, listing: { ...listing, status: "WAREHOUSED", mode: "DEFAULT_TEMPLATE_UNCHANGED", channel: "TAOBAO", warehousedAt: new Date().toISOString(), taobaoItemId: parsed.data.taobaoItemId, taobaoItemUrl: parsed.data.taobaoItemUrl } }) }).eq("id", parsed.data.productId).eq("user_id", auth.user.id);
+  const update = await db.from("candidate_products").update({ notes: JSON.stringify({ ...trace, listing: { ...listing, status: "SUBMITTED", mode: "DEFAULT_TEMPLATE_UNCHANGED", channel: "TAOBAO", submittedAt: new Date().toISOString(), provisionalTaobaoItemId: parsed.data.taobaoItemId, provisionalTaobaoItemUrl: parsed.data.taobaoItemUrl, taobaoItemId: null, taobaoItemUrl: null, error: "等待 1688 官方铺货日志核验" } }) }).eq("id", parsed.data.productId).eq("user_id", auth.user.id);
   if (update.error) return Response.json({ error: update.error.message }, { status: 500 });
   return Response.json({ ok: true });
 }

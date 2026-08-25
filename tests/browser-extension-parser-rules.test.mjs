@@ -228,10 +228,16 @@ assert.match(source, /async function startDefaultPublish/, "扩展必须提供�
 assert.match(source, /clicked_immediate_publish/, "自动铺货必须先点击立即铺货");
 assert.match(source, /checked_default_store/, "自动铺货必须勾选默认淘宝店铺");
 assert.match(source, /confirmed_publish/, "自动铺货必须点击确定铺货");
+assert.match(source, /立即铺货\(\?:（\(\?:单店\|多店\)）/, "确认店铺必须兼容‘立即铺货（单店/多店）’按钮");
+assert.match(background, /立即铺货\(\?:（\(\?:单店\|多店\)）/, "后台兜底点击必须兼容‘立即铺货（单店/多店）’按钮");
 assert.match(source, /START_DEFAULT_PUBLISH/, "详情页必须接收默认铺货指令");
 assert.match(bridge, /AI_SHOP_PUBLISH_1688/, "本地应用必须能通过扩展桥发起铺货任务");
 assert.match(background, /async function publishDefaultListing/, "后台必须编排完整铺货任务");
 assert.match(background, /waitForTaobaoPublishResult/, "铺货完成后必须识别淘宝商品ID");
+assert.match(background, /createdAfterSubmission/, "铺货结果只能来自本次操作后新建的标签页");
+assert.match(background, /navigatedAfterSubmission/, "铺货结果可以来自本次操作后URL发生变化的标签页");
+assert.doesNotMatch(background, /recentlyActivated/, "铺货结果禁止复用仅被激活的旧淘宝标签页");
+assert.doesNotMatch(background, /aiPublishPage\s*=/, "铺货结果禁止因旧页面带fromAIPublish标记而直接成功");
 assert.match(selectionCenter, /尚未运行本轮「AI评估货源」/, "AI评估Tab只能展示已保存结果或空状态");
 assert.match(aiSelectionRoute, /offer-source-evaluation-v1/, "AI评估必须使用独立缓存版本");
 assert.match(aiSelectionRoute, /function diversifyRecommendations/, "AI推荐必须经过确定性差异化复核，不能只依赖模型措辞");

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import { downloadAiImage, readAiImageCache } from "@/lib/sourcing/ai-image-cache";
+import { isImageUnsupportedError, productRecognitionMode } from "@/lib/ai/image-capability";
 
 export const maxDuration = 180;
 
@@ -71,10 +72,14 @@ function verifyRecognitionCategory(result: Recognition, offer: ReturnType<typeof
   };
 }
 
-function normalizeRecognitionOutput(value: unknown) {
+function normalizeRecognitionOutput(value: unknown, allowImageEvidence = true) {
   const root = record(value), rawResults = Array.isArray(root.results) ? root.results.map(record) : [];
   const confidence = (input: unknown) => input === "HIGH" || input === "高" ? "HIGH" : input === "LOW" || input === "低" ? "LOW" : "MEDIUM";
-  const evidenceSource = (input: unknown) => ["main_image", "sku_image", "sku_name", "attribute", "detail", "original_title"].includes(String(input)) ? String(input) : "original_title";
+  const evidenceSource = (input: unknown) => {
+    const source = String(input);
+    if (!allowImageEvidence && ["main_image", "sku_image"].includes(source)) return "original_title";
+    return ["main_image", "sku_image", "sku_name", "attribute", "detail", "original_title"].includes(source) ? source : "original_title";
+  };
   const removedReason = (input: unknown) => ["重复词", "泛化词", "无证据卖点", "来源词", "非核心规格", "风险表述"].includes(String(input)) ? String(input) : "无证据卖点";
   return { results: rawResults.map((item) => {
     const mixedSelling = item.mixedSelling === true;
@@ -152,6 +157,8 @@ export async function POST(request: Request) {
   if (saved.length === offers.length && saved.every((item) => item.inputHash === inputHash)) return Response.json({ ok: true, deduplicated: true, results: saved });
   const apiKey = process.env.VISION_API_KEY || process.env.OPENAI_API_KEY, model = process.env.VISION_MODEL || process.env.OPENAI_MODEL;
   const baseUrl = (process.env.VISION_BASE_URL || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
+  const configuredMode = productRecognitionMode(process.env.VISION_MODEL);
+  let actualAnalysisMode: "vision" | "text" = configuredMode;
   if (!apiKey || !model) return Response.json({ error: "缺少多模态商品识别模型配置" }, { status: 500 });
   const allResults: z.infer<typeof resultSchema>["results"] = [], started = performance.now();
   const batches = offers.map((offer) => [offer]);
@@ -165,23 +172,33 @@ export async function POST(request: Request) {
 
 【证据】每个进入sellingTitle的特征必须返回titleFeatures证据；证据不足就删除，不得依靠常识补全。优先级：主图/SKU图/明确属性/详情，其次SKU名称，原始标题只作辅助。对“不粘毛、易清洁、耐抓耐磨”等无法由输入明确证明的描述必须删除并写入removedClaims。分类使用输入中的固定分类树和已有分类，不创建新分类；不使用程序名称词典。
 
-再评估货源，但不得重复固定阈值、设置主备货源或猜测SKU价格库存。maxTitleChars=${parsed.data.maxTitleChars}。分类树=${JSON.stringify(categories)}。仅输出JSON：{"results":[{"offerId":"uuid","offerType":"SINGLE_PRODUCT|MIXED_SKU","productGroups":[{"standardName":"","coreProductType":"","sellingTitle":"","titleFeatures":[{"feature":"","evidence":"","evidenceSource":"main_image|sku_image|sku_name|attribute|detail|original_title"}],"removedClaims":[{"claim":"","reason":"重复词|泛化词|无证据卖点|来源词|非核心规格|风险表述"}],"categoryParent":"父分类","categoryChild":"子分类","skuIds":["sku-id"],"confidence":"HIGH|MEDIUM|LOW","needsReview":false,"reviewReason":"","attributes":{}}],"mixedSelling":false,"mixedSellingType":"NONE|VARIANT_ONLY|ACCESSORY_MIX|MULTI_PRODUCT","unresolvedSkus":[],"evidence":["识别依据"],"risks":[],"sourceEvaluation":{"recommendation":"RECOMMENDED|USABLE|CAUTIOUS|NOT_RECOMMENDED","confidence":"HIGH|MEDIUM|LOW","dimensions":{"dropshipFit":"结论","supplyStability":"结论","fulfillmentStability":"结论","qualityConfidence":"结论","supplierStability":"结论"},"directionKey":"现有分类+核心结构+使用场景","advantages":[],"risks":[],"conflicts":[],"missingEvidence":[],"recommendationReason":"理由","finalAdvice":"建议"}}]}` }];
+再评估货源，但不得重复固定阈值、设置主备货源或猜测SKU价格库存。${configuredMode === "text" ? "本次没有配置视觉模型，只能使用标题、属性、SKU名称和详情文字；严禁声称查看了主图或SKU图，严禁使用main_image或sku_image作为证据，无法从文字确认的外观与材质必须标记待复核。" : "本次已配置视觉模型，可以结合提供的主图识别。"}maxTitleChars=${parsed.data.maxTitleChars}。分类树=${JSON.stringify(categories)}。仅输出JSON：{"results":[{"offerId":"uuid","offerType":"SINGLE_PRODUCT|MIXED_SKU","productGroups":[{"standardName":"","coreProductType":"","sellingTitle":"","titleFeatures":[{"feature":"","evidence":"","evidenceSource":"main_image|sku_image|sku_name|attribute|detail|original_title"}],"removedClaims":[{"claim":"","reason":"重复词|泛化词|无证据卖点|来源词|非核心规格|风险表述"}],"categoryParent":"父分类","categoryChild":"子分类","skuIds":["sku-id"],"confidence":"HIGH|MEDIUM|LOW","needsReview":false,"reviewReason":"","attributes":{}}],"mixedSelling":false,"mixedSellingType":"NONE|VARIANT_ONLY|ACCESSORY_MIX|MULTI_PRODUCT","unresolvedSkus":[],"evidence":["识别依据"],"risks":[],"sourceEvaluation":{"recommendation":"RECOMMENDED|USABLE|CAUTIOUS|NOT_RECOMMENDED","confidence":"HIGH|MEDIUM|LOW","dimensions":{"dropshipFit":"结论","supplyStability":"结论","fulfillmentStability":"结论","qualityConfidence":"结论","supplierStability":"结论"},"directionKey":"现有分类+核心结构+使用场景","advantages":[],"risks":[],"conflicts":[],"missingEvidence":[],"recommendationReason":"理由","finalAdvice":"建议"}}]}` }];
       for (const offer of batch) {
         const sourceRow = eligibleRows.find((row) => String(row.id) === offer.offerId), raw = record(sourceRow?.raw_data);
         const existingRecognition = record(raw.productRecognition);
         content.push({ type: "text", text: `Offer事实：${JSON.stringify({ offerId: offer.offerId, title: offer.title, existingCategory: { parent: existingRecognition.categoryParent ?? null, child: existingRecognition.categoryChild ?? null }, productAttributes: withoutPriceFields(offer.productAttributes), skus: offer.skus.map((sku) => ({ id: sku.id, name: sku.name, values: sku.values, hasImage: Boolean(sku.image) })), ruleSelection: record(raw.ruleSelection), offerFacts: withoutPriceFields(record(raw.offerFacts)) })}` });
-        if (typeof offer.mainImage === "string" && /^https?:/i.test(offer.mainImage)) {
+        if (configuredMode === "vision" && typeof offer.mainImage === "string" && /^https?:/i.test(offer.mainImage)) {
           const imageData = offer.cachedImage?.dataUrl ?? (await downloadAiImage(offer.mainImage)).dataUrl;
           content.push({ type: "image_url", image_url: { url: imageData, detail: "low" } });
         }
       }
-      const response = await fetch(`${baseUrl}/chat/completions`, { method: "POST", headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, body: JSON.stringify({ model, messages: [{ role: "system", content: "关闭深度思考。只输出合法JSON。标准商品名用于同类统一，售卖标题必须真实自然且逐项提供证据；分类只能来自给定分类树。" }, { role: "user", content }], response_format: { type: "json_object" }, max_tokens: 1800, stream: false, thinking: { type: "disabled" } }), signal: AbortSignal.timeout(45_000) });
-      const responseText = await response.text();
+      const requestModel = async (requestContent: Array<Record<string, unknown>>) => {
+        const response = await fetch(`${baseUrl}/chat/completions`, { method: "POST", headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, body: JSON.stringify({ model, messages: [{ role: "system", content: "关闭深度思考。只输出合法JSON。标准商品名用于同类统一，售卖标题必须真实自然且逐项提供证据；分类只能来自给定分类树。" }, { role: "user", content: requestContent }], response_format: { type: "json_object" }, max_tokens: 1800, stream: false, thinking: { type: "disabled" } }), signal: AbortSignal.timeout(45_000) });
+        return { response, responseText: await response.text() };
+      };
+      let { response, responseText } = await requestModel(content);
       let body: { choices?: Array<{ message?: { content?: string } }>; error?: { message?: string } } = {};
       try { body = responseText ? JSON.parse(responseText) as typeof body : {}; } catch { throw new Error(`视觉模型返回了无法解析的响应（HTTP ${response.status}）`); }
+      if (!response.ok && configuredMode === "vision" && isImageUnsupportedError(body.error?.message ?? responseText)) {
+        actualAnalysisMode = "text";
+        const textOnlyContent = content.filter((part) => part.type !== "image_url");
+        textOnlyContent[0] = { type: "text", text: `${String(textOnlyContent[0]?.text ?? "")}\n视觉输入不可用，本次已降级为纯文字识别；不得使用图片作为证据，外观与材质不确定时必须标记待复核。` };
+        ({ response, responseText } = await requestModel(textOnlyContent));
+        try { body = responseText ? JSON.parse(responseText) as typeof body : {}; } catch { throw new Error(`文字降级模型返回了无法解析的响应（HTTP ${response.status}）`); }
+      }
       if (!response.ok) throw new Error(body.error?.message ?? `视觉模型请求失败（HTTP ${response.status}）`);
       let value: unknown; try { value = JSON.parse(body.choices?.[0]?.message?.content ?? ""); } catch { throw new Error("视觉模型未返回合法JSON"); }
-      const output = resultSchema.safeParse(normalizeRecognitionOutput(value));
+      const output = resultSchema.safeParse(normalizeRecognitionOutput(value, actualAnalysisMode === "vision"));
       if (!output.success) throw new Error("视觉模型返回的商品识别字段不完整");
       const offerById = new Map(batch.map((offer) => [offer.offerId, offer]));
       return output.data.results.map((result) => {
@@ -206,7 +223,7 @@ export async function POST(request: Request) {
       ...result,
       // Transitional display aliases for old clients; v2 consumers use productGroups.
       productName: primary.standardName, sellingTitle: primary.sellingTitle, categoryParent: primary.categoryParent, categoryChild: primary.categoryChild, confidence: primary.confidence,
-      analyzedAt, analysisRunId, inputHash, promptVersion: PROMPT_VERSION, model,
+      analyzedAt, analysisRunId, inputHash, promptVersion: PROMPT_VERSION, model, analysisMode: actualAnalysisMode,
     }, aiSelection: { offerId: String(row.id), ...evaluation, analyzedAt, analysisRunId, inputHash, promptVersion: "offer-source-evaluation-v2-combined", model } } }).eq("id", row.id);
   });
   const persisted = await Promise.all(persistence);

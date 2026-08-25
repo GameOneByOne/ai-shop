@@ -175,35 +175,25 @@ async function confirmDefaultPublishInFrames(tabId) {
           for (let i = 0; i < roots.length; i += 1) for (const node of roots[i].querySelectorAll('*')) if (node.shadowRoot && !roots.includes(node.shadowRoot)) roots.push(node.shadowRoot);
           const queryDeep = selector => roots.flatMap(root => [...root.querySelectorAll(selector)]);
           const title = queryDeep('div,span,h1,h2,h3,h4').some(n => visible(n) && clean(n.textContent) === '确认店铺');
-          const checkboxes = queryDeep('input[type="checkbox"],[role="checkbox"],.ant-checkbox,.next-checkbox')
-            .filter(n => visible(n) && !n.disabled && n.getAttribute('aria-disabled') !== 'true')
-            .map(n => ({ n, r:n.getBoundingClientRect() }))
-            .filter(({r}) => r.width >= 8 && r.height >= 8 && r.width <= 48 && r.height <= 48)
-            .sort((a,b) => {
-              const score = ({r}) => (r.left > innerWidth * .55 ? 1000 : 0) + (r.top < innerHeight * .85 ? 100 : 0) - Math.abs(r.width-r.height) - r.width;
-              return score(b) - score(a);
-            });
-          const checkbox = checkboxes[0]?.n;
+          const checkbox = queryDeep('input[type="checkbox"],[role="checkbox"]').find(n => visible(n) && !n.disabled && n.getAttribute('aria-disabled') !== 'true');
           if (!title || !checkbox) return null;
-          const r = checkbox.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
-          let hit = document.elementFromPoint(x, y);
-          while (hit?.shadowRoot?.elementFromPoint) { const deeper = hit.shadowRoot.elementFromPoint(x, y); if (!deeper || deeper === hit) break; hit = deeper; }
+          const r = checkbox.getBoundingClientRect(), hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
           let shadowHost = checkbox.getRootNode()?.host, hostHit = false;
           while (shadowHost) { if (shadowHost === hit) hostHit = true; shadowHost = shadowHost.getRootNode()?.host; }
           const validHit = !!hit && (hit === checkbox || checkbox.contains(hit) || hostHit || hit.closest?.('input[type="checkbox"],[role="checkbox"],.ant-checkbox,.next-checkbox'));
           return { rect: { left:r.left, top:r.top, width:r.width, height:r.height }, validHit, tag:checkbox.tagName, cls:checkbox.className || '' };
         })()`);
-        if (value?.rect) { candidate = { frameId, contextId, ...value }; break; }
+        if (value?.validHit) { candidate = { frameId, contextId, ...value }; break; }
       }
       if (!candidate) await new Promise((resolve) => setTimeout(resolve, 250));
     }
-    if (!candidate) throw new Error("未在“确认店铺”抽屉中找到店铺小方框");
-    const offsets = [[0,0],[-2,0],[2,0],[0,-2],[0,2],[-3,-3],[3,-3],[-3,3],[3,3]];
+    if (!candidate) throw new Error("未在“确认店铺”内嵌窗口中精确命中店铺小方框");
+    const offsets = [0, -2, 2];
     let checked = false;
-    for (const [offsetX, offsetY] of offsets) {
-      const localPoint = { x: candidate.rect.left + candidate.rect.width / 2 + offsetX, y: candidate.rect.top + candidate.rect.height / 2 + offsetY };
+    for (const offset of offsets) {
+      const localPoint = { x: candidate.rect.left + candidate.rect.width / 2 + offset, y: candidate.rect.top + candidate.rect.height / 2 };
       await mouseClick(await framePointToTop(candidate.frameId, localPoint));
-      await new Promise((resolve) => setTimeout(resolve, 350));
+      await new Promise((resolve) => setTimeout(resolve, 450));
       checked = await evaluate(candidate.contextId, `(() => {
         const visible = n => { const r=n?.getBoundingClientRect?.(); return !!r && r.width>0 && r.height>0; };
         const roots=[document]; for(let i=0;i<roots.length;i+=1) for(const node of roots[i].querySelectorAll('*')) if(node.shadowRoot&&!roots.includes(node.shadowRoot)) roots.push(node.shadowRoot);
@@ -214,7 +204,7 @@ async function confirmDefaultPublishInFrames(tabId) {
       })()`);
       if (checked) break;
     }
-    if (!checked) throw new Error(`CDP 已尝试9个落点点击店铺小方框但未选中（frame=${candidate.frameId}, tag=${candidate.tag}, class=${candidate.cls}, hit=${candidate.validHit}）`);
+    if (!checked) throw new Error(`CDP 已尝试3次点击店铺小方框但未选中（frame=${candidate.frameId}, tag=${candidate.tag}, class=${candidate.cls}）`);
     let confirm = null;
     for (let attempt = 0; attempt < 25 && !confirm; attempt += 1) {
       confirm = await evaluate(candidate.contextId, `(() => {
@@ -222,7 +212,8 @@ async function confirmDefaultPublishInFrames(tabId) {
         const visible=n=>{const r=n?.getBoundingClientRect?.();return !!r&&r.width>0&&r.height>0;};
         const roots=[document]; for(let i=0;i<roots.length;i+=1) for(const node of roots[i].querySelectorAll('*')) if(node.shadowRoot&&!roots.includes(node.shadowRoot)) roots.push(node.shadowRoot);
         const buttons=roots.flatMap(root=>[...root.querySelectorAll('button,[role="button"]')]);
-        const button=buttons.filter(n=>visible(n)&&!n.disabled&&n.getAttribute('aria-disabled')!=='true'&&(clean(n.innerText||n.textContent)==='立即铺货'||(n.getBoundingClientRect().width>200&&n.getBoundingClientRect().bottom>innerHeight*.75))).sort((a,b)=>b.getBoundingClientRect().bottom-a.getBoundingClientRect().bottom)[0];
+        const immediatePublishPattern=/^立即铺货(?:（(?:单店|多店)）|\((?:单店|多店)\))?$/;
+        const button=buttons.filter(n=>visible(n)&&!n.disabled&&n.getAttribute('aria-disabled')!=='true'&&(immediatePublishPattern.test(clean(n.innerText||n.textContent))||(n.getBoundingClientRect().width>200&&n.getBoundingClientRect().bottom>innerHeight*.75))).sort((a,b)=>b.getBoundingClientRect().bottom-a.getBoundingClientRect().bottom)[0];
         if (!button || button.disabled || button.getAttribute('aria-disabled')==='true') return null;
         const r=button.getBoundingClientRect(); return {left:r.left,top:r.top,width:r.width,height:r.height};
       })()`);
@@ -238,148 +229,20 @@ async function confirmDefaultPublishInFrames(tabId) {
 }
 
 async function waitForTaobaoPublishResult(sourceTabId, beforeTabs, timeout = 90000) {
-  const deadline = Date.now() + timeout, waitingStartedAt = Date.now();
+  const submittedAt = Date.now();
+  const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     const tabs = await chrome.tabs.query({});
     for (const tab of tabs) {
-      const changed = tab.id === sourceTabId || !beforeTabs.has(tab.id) || beforeTabs.get(tab.id) !== tab.url;
-      const recentlyActivated = typeof tab.lastAccessed === "number" && tab.lastAccessed >= waitingStartedAt - 5000;
-      const aiPublishPage = /[?&]fromAIPublish=true(?:&|$)/i.test(tab.url || "");
-      if (!changed && !recentlyActivated && !aiPublishPage) continue;
+      const createdAfterSubmission = !beforeTabs.has(tab.id);
+      const navigatedAfterSubmission = beforeTabs.has(tab.id) && beforeTabs.get(tab.id) !== tab.url;
+      if (tab.id !== sourceTabId && !createdAfterSubmission && !navigatedAfterSubmission) continue;
       const reference = taobaoPublishReference(tab.url);
       if (reference && /(?:item\.upload|item|sell)\.taobao\.com/i.test(tab.url || "")) return reference;
-      if (tab.id != null && /(?:item\.upload|item|sell)\.taobao\.com/i.test(tab.url || "")) {
-        const injected = await chrome.scripting.executeScript({
-          target: { tabId: tab.id, allFrames: true },
-          func: () => {
-            const values = [location.href, document.URL, document.documentElement?.innerHTML?.slice(0, 500000) || ""];
-            for (const value of values) {
-              const match = String(value).match(/[?&]itemId=(\d{8,})/i) || String(value).match(/\"itemId\"\s*:\s*\"?(\d{8,})/i);
-              if (match) return match[1];
-            }
-            return null;
-          },
-        }).catch(() => []);
-        const itemId = injected.map((item) => item.result).find((value) => /^\d{8,}$/.test(String(value || "")));
-        if (itemId) return { taobaoItemId: String(itemId), taobaoItemUrl: tab.url || `https://item.upload.taobao.com/sell/v2/publish.htm?itemId=${itemId}` };
-      }
     }
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
   throw new Error("铺货操作已提交，但未识别到淘宝商品 ID；请检查新打开的淘宝发布页");
-}
-
-async function captureTaobaoDraft(itemId, onProgress = () => {}) {
-  if (!/^\d{8,}$/.test(String(itemId || ""))) throw new Error("淘宝商品ID无效");
-  const targetUrl = `https://item.upload.taobao.com/sell/v2/publish.htm?itemId=${itemId}&fromAIPublish=true`;
-  const tabs = await chrome.tabs.query({});
-  let tab = tabs.find((item) => String(item.url || "").includes(`itemId=${itemId}`));
-  if (!tab?.id) tab = await chrome.tabs.create({ url: targetUrl, active: true });
-  else await chrome.tabs.update(tab.id, { active: true });
-  if (!tab.id) throw new Error("无法打开淘宝仓库商品编辑页");
-  onProgress({ stage: "opening", message: "正在打开并读取淘宝仓库商品" });
-  await waitForTab(tab.id, 30000).catch(() => undefined);
-  await new Promise((resolve) => setTimeout(resolve, 1800));
-  const frames = await chrome.scripting.executeScript({
-    target: { tabId: tab.id, allFrames: true },
-    func: () => {
-      const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
-      const roots = [document];
-      for (let i = 0; i < roots.length; i += 1) for (const node of roots[i].querySelectorAll("*")) if (node.shadowRoot && !roots.includes(node.shadowRoot)) roots.push(node.shadowRoot);
-      const deep = (selector) => roots.flatMap((root) => [...root.querySelectorAll(selector)]);
-      const visible = (node) => { const rect = node?.getBoundingClientRect?.(); return !!rect && rect.width > 0 && rect.height > 0; };
-      const valueNear = (labelText) => {
-        for (const label of deep("label,div,span,p").filter((node) => visible(node) && clean(node.textContent).includes(labelText))) {
-          let current = label;
-          for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
-            const control = current.querySelector?.('input:not([type="hidden"]),textarea,[contenteditable="true"],select');
-            if (control && visible(control)) return clean(control.value ?? control.textContent);
-          }
-        }
-        return "";
-      };
-      const pageText = clean(document.body?.innerText).slice(0, 30000);
-      const categoryMatch = pageText.match(/当前类目\s*[:：]?\s*([^\n]{2,120})/) || pageText.match(/商品类目\s*[:：]?\s*([^\n]{2,120})/);
-      const imageUrls = [...new Set(deep("img").filter(visible).map((img) => img.currentSrc || img.src).filter((url) => /^https?:\/\//.test(url) && !/avatar|logo|icon/i.test(url)))].slice(0, 40);
-      const attributes = [];
-      for (const control of deep('input:not([type="hidden"]),select').filter(visible).slice(0, 150)) {
-        const name = clean(control.getAttribute("aria-label") || control.name || control.placeholder);
-        const value = clean(control.value);
-        if (name && value && !/标题|价格|库存|商家编码/.test(name)) attributes.push({ name, value });
-      }
-      const skus = deep("tr").filter(visible).map((row) => {
-        const text = clean(row.innerText);
-        const inputs = [...row.querySelectorAll("input")].map((input) => clean(input.value));
-        return inputs.length >= 2 && /库存|价格|商家编码|SKU/i.test(text) ? { name: text.slice(0, 120), price: inputs[0] || "", stock: inputs[1] || "", merchantCode: inputs[2] || "" } : null;
-      }).filter(Boolean).slice(0, 200);
-      return { title: valueNear("宝贝标题"), guideTitle: valueNear("导购标题"), category: categoryMatch?.[1] || "", attributes, skus, imageUrls, pageText };
-    },
-  });
-  const parts = frames.map((entry) => entry.result).filter(Boolean);
-  const best = parts.sort((a, b) => (b.title ? 1000 : 0) + b.pageText.length - ((a.title ? 1000 : 0) + a.pageText.length))[0];
-  if (!best?.title) throw new Error("未读取到淘宝草稿标题，请确认商品发布页已加载完成");
-  onProgress({ stage: "captured", message: "淘宝草稿已读取，准备交给AI质检" });
-  return { snapshot: { itemId: String(itemId), url: tab.url || targetUrl, category: best.category, title: best.title, guideTitle: best.guideTitle, attributes: best.attributes, skus: best.skus, imageUrls: best.imageUrls, pageText: best.pageText } };
-}
-
-async function autofillTaobaoWarehouseItem(itemId, materialMaster, onProgress = () => {}) {
-  if (!/^\d{8,}$/.test(String(itemId || ""))) throw new Error("淘宝商品ID无效");
-  const targetUrl = `https://item.upload.taobao.com/sell/v2/publish.htm?itemId=${itemId}&fromAIPublish=true`;
-  const tabs = await chrome.tabs.query({});
-  let tab = tabs.find((item) => String(item.url || "").includes(`itemId=${itemId}`));
-  if (!tab?.id) tab = await chrome.tabs.create({ url: targetUrl, active: true });
-  else await chrome.tabs.update(tab.id, { active: true });
-  if (!tab.id) throw new Error("无法打开淘宝仓库商品编辑页");
-  onProgress({ stage: "opening", message: "正在打开淘宝仓库商品" });
-  await waitForTab(tab.id, 30000).catch(() => undefined);
-  await new Promise((resolve) => setTimeout(resolve, 1800));
-  onProgress({ stage: "writing", message: "正在填写标题和导购标题" });
-  const payload = { title: String(materialMaster?.title || "").slice(0, 30), guideTitle: String(materialMaster?.guideTitle || "").slice(0, 30) };
-  if (!payload.title) throw new Error("商品素材母版缺少标题");
-  const results = await chrome.scripting.executeScript({
-    target: { tabId: tab.id, allFrames: true },
-    args: [payload],
-    func: (values) => {
-      const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
-      const roots = [document];
-      for (let i = 0; i < roots.length; i += 1) for (const node of roots[i].querySelectorAll("*")) if (node.shadowRoot && !roots.includes(node.shadowRoot)) roots.push(node.shadowRoot);
-      const deep = (selector) => roots.flatMap((root) => [...root.querySelectorAll(selector)]);
-      const visible = (node) => { const rect = node?.getBoundingClientRect?.(); return !!rect && rect.width > 0 && rect.height > 0; };
-      const controlNear = (labelText) => {
-        const labels = deep("label,div,span,p").filter((node) => visible(node) && clean(node.textContent).includes(labelText));
-        for (const label of labels) {
-          let current = label;
-          for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
-            const control = current.querySelector?.('input:not([type="hidden"]),textarea,[contenteditable="true"]');
-            if (control && visible(control)) return control;
-          }
-        }
-        return deep('input:not([type="hidden"]),textarea,[contenteditable="true"]').find((node) => visible(node) && [node.name, node.id, node.placeholder, node.getAttribute("aria-label")].some((value) => clean(value).includes(labelText.replace("宝贝", ""))));
-      };
-      const write = (control, value) => {
-        if (!control || !value) return false;
-        control.focus();
-        if (control.isContentEditable) control.textContent = value;
-        else {
-          const prototype = control instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-          const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
-          setter ? setter.call(control, value) : control.value = value;
-        }
-        for (const type of ["input", "change", "blur"]) control.dispatchEvent(new Event(type, { bubbles: true, composed: true }));
-        return clean(control.value ?? control.textContent) === clean(value);
-      };
-      const titleControl = controlNear("宝贝标题");
-      const guideControl = controlNear("导购标题");
-      const titleWritten = write(titleControl, values.title);
-      const guideWritten = values.guideTitle ? write(guideControl, values.guideTitle) : true;
-      return { titleFound: Boolean(titleControl), guideTitleFound: Boolean(guideControl), titleWritten, guideTitleWritten: guideWritten, titleValue: clean(titleControl?.value ?? titleControl?.textContent), guideTitleValue: clean(guideControl?.value ?? guideControl?.textContent) };
-    },
-  });
-  const result = results.map((entry) => entry.result).find((entry) => entry?.titleWritten) || results.map((entry) => entry.result).find((entry) => entry?.titleFound);
-  if (!result?.titleWritten) throw new Error(`未能写入宝贝标题（找到控件=${Boolean(result?.titleFound)}）`);
-  if (payload.guideTitle && !result.guideTitleWritten) throw new Error(`宝贝标题已写入，但导购标题未能写入（找到控件=${Boolean(result?.guideTitleFound)}）`);
-  onProgress({ stage: "verified", message: "标题字段已写入并回读验证" });
-  return { ok: true, itemId: String(itemId), fields: result, next: "SKU_SCHEMA_SCAN" };
 }
 
 async function publishDefaultListing(sourceUrl, onProgress = () => {}) {
@@ -400,6 +263,39 @@ async function publishDefaultListing(sourceUrl, onProgress = () => {}) {
   }
   onProgress({ stage: "waiting_result", message: "已确定铺货，正在识别淘宝商品 ID" });
   return waitForTaobaoPublishResult(tab.id, before);
+}
+
+const DISTRIBUTION_LOG_URL = 'https://ufuwu.1688.com/page/fuwu_work_isv_container.htm?role=buyer&appkey=2839818&state=%7B%22scene_type%22%3A%22shop_distribute_log%22%2C%22ext_value%22%3A%22productSuccess%22%2C%22shopCode%22%3A%221999719428%22%2C%22channel%22%3A%22thyny%22%7D';
+
+async function readOfficialDistributionLog() {
+  await assertHostAccess(DISTRIBUTION_LOG_URL);
+  const existing = (await chrome.tabs.query({})).find((tab) => String(tab.url || '').startsWith('https://ufuwu.1688.com/page/fuwu_work_isv_container.htm'));
+  const tab = existing || await chrome.tabs.create({ url: DISTRIBUTION_LOG_URL, active: false });
+  if (tab.id == null) throw new Error('无法打开 1688 官方铺货日志');
+  if (!existing || tab.status !== 'complete') await waitForTab(tab.id, 30000);
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: tab.id, allFrames: true },
+    func: () => {
+      const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+      const itemIdFromUrl = (url) => {
+        const match = String(url || '').match(/[?&](?:itemId|id)=(\d{8,})/i);
+        return match?.[1] || null;
+      };
+      return [...document.querySelectorAll('tr')].map((row) => {
+        const text = clean(row.innerText || row.textContent);
+        const offerId = (text.match(/(?:ID|货源编号)\s*[:：]?\s*(\d{8,})/i) || text.match(/\b(\d{10,})\b/))?.[1];
+        if (!offerId || !/铺货成功|铺货失败|铺货中|待发起|已取消/.test(text)) return null;
+        const links = [...row.querySelectorAll('a[href]')].map((anchor) => ({ text: clean(anchor.textContent), href: anchor.href }));
+        const edit = links.find((link) => /编辑店铺商品|编辑店铺草稿|查看商品/.test(link.text)) || links.find((link) => itemIdFromUrl(link.href));
+        const status = text.includes('铺货成功') ? 'SUCCESS' : text.includes('铺货失败') ? 'FAILED' : text.includes('已取消') ? 'CANCELLED' : 'PROCESSING';
+        return { offerId, status, message: text.slice(0, 1000), taobaoItemId: itemIdFromUrl(edit?.href), taobaoItemUrl: edit?.href || null };
+      }).filter(Boolean);
+    },
+  });
+  const rows = results.flatMap((result) => Array.isArray(result.result) ? result.result : []);
+  const unique = [...new Map(rows.map((row) => [`${row.offerId}:${row.status}`, row])).values()];
+  if (!unique.length) throw new Error('官方铺货日志已打开，但没有读取到记录；请确认已登录 1688 后重试');
+  return { rows: unique, logUrl: DISTRIBUTION_LOG_URL };
 }
 
 async function readPageKeyword(tabId) {
@@ -991,20 +887,13 @@ async function enrichOffers(offers, onProgress = () => {}, factsOnly = false, re
 }
 
 chrome.runtime.onConnect.addListener((port) => {
-  if (!["DETAIL_ENRICHMENT", "OFFER_CAPTURE", "LISTING_PUBLISH", "TAOBAO_AUTOFILL", "TAOBAO_DRAFT_CAPTURE"].includes(port.name)) return;
+  if (!["DETAIL_ENRICHMENT", "OFFER_CAPTURE", "LISTING_PUBLISH", "DISTRIBUTION_LOG_SYNC"].includes(port.name)) return;
   port.onMessage.addListener((message) => {
-    if (port.name === "TAOBAO_DRAFT_CAPTURE") {
-      if (message?.type !== "CAPTURE_TAOBAO_DRAFT") return;
-      void captureTaobaoDraft(message.itemId, (progress) => port.postMessage({ progress }))
+    if (port.name === "DISTRIBUTION_LOG_SYNC") {
+      if (message?.type !== "SYNC_DISTRIBUTION_LOG") return;
+      void readOfficialDistributionLog()
         .then((result) => port.postMessage(result))
-        .catch((error) => port.postMessage({ error: readableError(error, "淘宝草稿采集失败") }));
-      return;
-    }
-    if (port.name === "TAOBAO_AUTOFILL") {
-      if (message?.type !== "AUTOFILL_TAOBAO") return;
-      void autofillTaobaoWarehouseItem(message.itemId, message.materialMaster, (progress) => port.postMessage({ progress }))
-        .then((result) => port.postMessage(result))
-        .catch((error) => port.postMessage({ error: readableError(error, "淘宝自动填写失败") }));
+        .catch((error) => port.postMessage({ error: readableError(error, "读取官方铺货日志失败") }));
       return;
     }
     if (port.name === "LISTING_PUBLISH") {
